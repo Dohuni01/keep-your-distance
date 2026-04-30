@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.net.http.HttpClient;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -59,5 +60,13 @@ class OpenAiVisionServiceTest {
         );
 
         assertThat(requestJson).contains("\"max_output_tokens\" : 6000");
+    }
+
+    @Test
+    void openAiHttpClientUsesHttp11ToAvoidHttp2StreamResets() {
+        HttpClient httpClient = (HttpClient) ReflectionTestUtils.getField(service, "httpClient");
+
+        assertThat(httpClient).isNotNull();
+        assertThat(httpClient.version()).isEqualTo(HttpClient.Version.HTTP_1_1);
     }
 }

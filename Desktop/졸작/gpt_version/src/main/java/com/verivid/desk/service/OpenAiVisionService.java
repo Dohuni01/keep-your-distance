@@ -41,6 +41,7 @@ public class OpenAiVisionService {
         this.objectMapper = objectMapper;
         this.properties = properties;
         this.httpClient = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
                 .connectTimeout(Duration.ofSeconds(20))
                 .build();
         this.baseInstructions = new ClassPathResource("openai/video-analysis-instructions.txt")
