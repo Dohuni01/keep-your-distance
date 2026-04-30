@@ -115,7 +115,7 @@ public class OpenAiVisionService {
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("model", model);
             payload.put("store", false);
-            payload.put("max_output_tokens", 2400);
+            payload.put("max_output_tokens", 6000);
             payload.put("input", List.of(Map.of(
                     "role", "user",
                     "content", content
@@ -164,6 +164,7 @@ public class OpenAiVisionService {
     private GptStructuredAnalysis parseStructuredResponse(String responseBody) {
         try {
             JsonNode root = objectMapper.readTree(responseBody);
+            rejectIncompleteResponse(root);
             String outputText = extractOutputText(root);
 
             if (outputText == null || outputText.isBlank()) {
@@ -175,6 +176,35 @@ public class OpenAiVisionService {
         } catch (IOException e) {
             throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "OpenAI 응답 파싱에 실패했습니다: " + e.getMessage(), e);
         }
+    }
+
+    private void rejectIncompleteResponse(JsonNode root) {
+        String reason = incompleteReason(root);
+        if (reason == null) {
+            return;
+        }
+
+        throw new ResponseStatusException(
+                HttpStatus.BAD_GATEWAY,
+                "OpenAI 응답이 길이 제한으로 중간에 잘렸습니다. reason=" + reason
+                        + ". 프레임 수를 줄이거나 max_output_tokens 설정을 늘려주세요."
+        );
+    }
+
+    private String incompleteReason(JsonNode root) {
+        if ("incomplete".equals(root.path("status").asText())) {
+            return root.path("incomplete_details").path("reason").asText("unknown");
+        }
+
+        JsonNode output = root.path("output");
+        if (output.isArray()) {
+            for (JsonNode item : output) {
+                if ("incomplete".equals(item.path("status").asText())) {
+                    return item.path("incomplete_details").path("reason").asText("unknown");
+                }
+            }
+        }
+        return null;
     }
 
     private String extractOutputText(JsonNode root) {
