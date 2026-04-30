@@ -16,37 +16,50 @@ class OpenAiPromptContractTest {
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Test
-    void instructionsDescribeEvidenceCounterEvidenceLimitsAndScoreCalibration() throws Exception {
+    void instructionsDescribeDeepfakeEvidenceLimitsAndScoreCalibration() throws Exception {
         String instructions = new ClassPathResource("openai/video-analysis-instructions.txt")
                 .getContentAsString(StandardCharsets.UTF_8);
 
         assertThat(instructions)
-                .contains("증거-반증-한계")
+                .contains("evidence-first")
+                .contains("FACE_SWAP_OR_DEEPFAKE")
+                .contains("입/치아/혀/립싱크")
+                .contains("confidence_cap_reason")
                 .contains("0.00~0.20")
                 .contains("0.81~1.00")
-                .contains("primary_signals에는")
-                .contains("realism_signals에는")
-                .contains("score_rationale에는");
+                .contains("metric_interpretation");
     }
 
     @Test
-    void schemaRequiresExplainableSummaryAndFrameEvidenceFields() throws Exception {
+    void schemaRequiresDeepfakeProbabilitiesAndFrameEvidenceFields() throws Exception {
         String schemaJson = new ClassPathResource("openai/analysis-schema.json")
                 .getContentAsString(StandardCharsets.UTF_8);
         JsonNode schema = objectMapper.readTree(schemaJson);
 
         assertThat(requiredNames(schema))
                 .contains(
+                        "ai_generated_probability",
+                        "deepfake_probability",
+                        "edited_probability",
+                        "real_camera_probability",
+                        "confidence_cap_reason",
                         "analysis_process",
                         "visual_evidence",
                         "realism_signals",
                         "score_rationale"
                 );
 
+        List<String> verdicts = new ArrayList<>();
+        schema.path("properties").path("verdict").path("enum").forEach(node -> verdicts.add(node.asText()));
+        assertThat(verdicts)
+                .contains("AI_GENERATED", "FACE_SWAP_OR_DEEPFAKE", "EDITED_OR_COMPOSITED");
+
         JsonNode frameSchema = schema.path("properties").path("frame_findings").path("items");
         assertThat(requiredNames(frameSchema))
                 .contains(
                         "observed_area",
+                        "face_consistency",
+                        "temporal_consistency",
                         "counter_cues",
                         "metric_interpretation"
                 );

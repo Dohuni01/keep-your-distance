@@ -1,7 +1,17 @@
 package com.verivid.desk.service;
 
 import com.verivid.desk.config.VerividProperties;
-import com.verivid.desk.model.*;
+import com.verivid.desk.model.AnalysisReport;
+import com.verivid.desk.model.AnalyzeOptions;
+import com.verivid.desk.model.ExtractedFrame;
+import com.verivid.desk.model.FrameEvidence;
+import com.verivid.desk.model.FrameMetrics;
+import com.verivid.desk.model.GptFrameFinding;
+import com.verivid.desk.model.GptStructuredAnalysis;
+import com.verivid.desk.model.OpenAiAnalysisEnvelope;
+import com.verivid.desk.model.ReportSummary;
+import com.verivid.desk.model.VerdictSummary;
+import com.verivid.desk.model.VideoExtractionResult;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -10,7 +20,11 @@ import org.springframework.web.server.ResponseStatusException;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Instant;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 
 @Service
 public class AnalysisService {
@@ -109,17 +123,7 @@ public class AnalysisService {
         for (ExtractedFrame frame : extraction.frames()) {
             GptFrameFinding finding = findingsByIndex.get(frame.index());
             if (finding == null) {
-                finding = new GptFrameFinding(
-                        frame.index(),
-                        "unclear",
-                        fallbackScore(frame.metrics()),
-                        "대표 프레임 전체",
-                        "모델이 이 프레임에 대한 구체 항목을 충분히 반환하지 않았습니다.",
-                        List.of("시각 단서 부족"),
-                        List.of("대표 프레임만으로는 AI 여부를 단정하기 어렵습니다."),
-                        "보조 수치는 참고값이며 단독 근거로 쓰지 않았습니다.",
-                        List.of("대표 프레임만으로는 한계가 있습니다.")
-                );
+                finding = fallbackFinding(frame);
             }
 
             frames.add(new FrameEvidence(
@@ -129,28 +133,38 @@ public class AnalysisService {
                     "/api/reports/" + reportId + "/assets/heatmap/" + frame.heatmapImagePath().getFileName(),
                     finding.label(),
                     finding.suspicious_score(),
-                    defaultText(finding.observed_area(), "대표 프레임 전체"),
+                    defaultText(finding.observed_area(), "샘플 프레임 전체"),
                     finding.short_note(),
                     safeList(finding.cues()),
                     safeList(finding.counter_cues()),
-                    defaultText(finding.metric_interpretation(), "보조 수치는 시각 단서와 함께 참고해야 합니다."),
+                    metricInterpretation(finding),
                     safeList(finding.caveats()),
                     frame.metrics()
             ));
         }
 
+        GptStructuredAnalysis analysis = envelope.analysis();
+        double aiProbability = calibratedAiProbability(analysis);
+        double confidence = calibratedConfidence(analysis.confidence(), extraction, options);
+        String confidenceCapReason = confidenceCapReason(analysis.confidence_cap_reason(), extraction, options);
+
         VerdictSummary summary = new VerdictSummary(
-                envelope.analysis().verdict(),
-                envelope.analysis().ai_probability(),
-                envelope.analysis().confidence(),
-                envelope.analysis().short_summary(),
-                safeList(envelope.analysis().analysis_process()),
-                safeList(envelope.analysis().primary_signals()),
-                safeList(envelope.analysis().visual_evidence()),
-                safeList(envelope.analysis().realism_signals()),
-                defaultText(envelope.analysis().score_rationale(), "점수 산정 이유가 응답에 포함되지 않았습니다."),
-                safeList(envelope.analysis().limitations()),
-                envelope.analysis().caution()
+                analysis.verdict(),
+                aiProbability,
+                analysis.ai_generated_probability(),
+                analysis.deepfake_probability(),
+                analysis.edited_probability(),
+                analysis.real_camera_probability(),
+                confidence,
+                confidenceCapReason,
+                analysis.short_summary(),
+                safeList(analysis.analysis_process()),
+                safeList(analysis.primary_signals()),
+                safeList(analysis.visual_evidence()),
+                safeList(analysis.realism_signals()),
+                defaultText(analysis.score_rationale(), "점수 산정 이유가 응답에 포함되지 않았습니다."),
+                safeList(analysis.limitations()),
+                analysis.caution()
         );
 
         return new AnalysisReport(
@@ -168,10 +182,26 @@ public class AnalysisService {
                 summary,
                 frames,
                 List.of(
-                        "이 결과는 대표 프레임 기반의 확률적 판단이며 법적 감정 결과가 아닙니다.",
+                        "이 결과는 샘플 프레임 기반 확률 판단이며 법적 감정 결과가 아닙니다.",
                         "heatmap은 프레임 변화량 시각화이며 단독 증거가 아닙니다.",
-                        "beauty filter, denoise, 압축, 저조도 촬영은 AI처럼 보일 수 있습니다."
+                        "압축, 화면녹화, 보정, 조명, 모션블러는 AI처럼 보이는 오판 요인이 될 수 있습니다."
                 )
+        );
+    }
+
+    private GptFrameFinding fallbackFinding(ExtractedFrame frame) {
+        return new GptFrameFinding(
+                frame.index(),
+                "unclear",
+                fallbackScore(frame.metrics()),
+                "샘플 프레임 전체",
+                "모델이 이 프레임에 대한 구체 항목을 충분히 반환하지 않았습니다.",
+                "얼굴 일관성 근거가 응답에 포함되지 않았습니다.",
+                "시간 일관성 근거가 응답에 포함되지 않았습니다.",
+                List.of("시각 단서 부족"),
+                List.of("샘플 프레임만으로는 AI 여부를 단정하기 어렵습니다."),
+                "보조 수치는 참고값이며 단독 근거로 쓰지 않습니다.",
+                List.of("샘플 프레임 기반 분석의 한계가 있습니다.")
         );
     }
 
@@ -204,7 +234,66 @@ public class AnalysisService {
                 + (metrics.edgeJump() * 0.20)
                 + (metrics.sharpnessSwing() * 0.25)
                 + (metrics.colorShift() * 0.10);
-        return Math.round(Math.min(1.0, weighted) * 1000.0) / 1000.0;
+        return round3(weighted);
+    }
+
+    static double calibratedAiProbability(GptStructuredAnalysis analysis) {
+        double categoryMax = Math.max(
+                Math.max(analysis.ai_generated_probability(), analysis.deepfake_probability()),
+                analysis.edited_probability()
+        );
+        return round3(Math.max(analysis.ai_probability(), categoryMax));
+    }
+
+    static double calibratedConfidence(double modelConfidence, VideoExtractionResult extraction, AnalyzeOptions options) {
+        return round3(Math.min(modelConfidence, confidenceCap(extraction, options)));
+    }
+
+    static String confidenceCapReason(String modelReason, VideoExtractionResult extraction, AnalyzeOptions options) {
+        List<String> reasons = new ArrayList<>();
+        if (modelReason != null && !modelReason.isBlank()) {
+            reasons.add(modelReason);
+        }
+        if (extraction.frames().size() <= 3) {
+            reasons.add("샘플 프레임 수가 적어 confidence를 제한했습니다.");
+        }
+        if (!options.includeHeatmapsInPrompt()) {
+            reasons.add("heatmap evidence가 GPT 입력에 포함되지 않아 confidence를 제한했습니다.");
+        }
+        if ("low".equalsIgnoreCase(options.imageDetail())) {
+            reasons.add("low detail 이미지 입력이라 미세한 얼굴/경계 단서 confidence를 제한했습니다.");
+        }
+        if (allMetricsNearZero(extraction)) {
+            reasons.add("프레임 간 보조 수치가 모두 0에 가까워 시간 변화 근거 confidence를 제한했습니다.");
+        }
+        return String.join(" ", reasons);
+    }
+
+    private static double confidenceCap(VideoExtractionResult extraction, AnalyzeOptions options) {
+        double cap = 0.92;
+        if (extraction.frames().size() <= 3) {
+            cap = Math.min(cap, 0.68);
+        }
+        if (!options.includeHeatmapsInPrompt()) {
+            cap = Math.min(cap, 0.70);
+        }
+        if ("low".equalsIgnoreCase(options.imageDetail())) {
+            cap = Math.min(cap, 0.72);
+        }
+        if (allMetricsNearZero(extraction)) {
+            cap = Math.min(cap, 0.60);
+        }
+        return cap;
+    }
+
+    private static boolean allMetricsNearZero(VideoExtractionResult extraction) {
+        return extraction.frames().stream().allMatch(frame -> {
+            FrameMetrics metrics = frame.metrics();
+            return metrics.temporalResidual() < 0.0001
+                    && metrics.edgeJump() < 0.0001
+                    && metrics.sharpnessSwing() < 0.0001
+                    && metrics.colorShift() < 0.0001;
+        });
     }
 
     private List<String> safeList(List<String> source) {
@@ -214,10 +303,22 @@ public class AnalysisService {
         return source;
     }
 
+    private String metricInterpretation(GptFrameFinding finding) {
+        String face = defaultText(finding.face_consistency(), "얼굴 일관성 설명 없음");
+        String temporal = defaultText(finding.temporal_consistency(), "시간 일관성 설명 없음");
+        return defaultText(finding.metric_interpretation(), "보조 수치는 시각 단서와 함께 참고해야 합니다.")
+                + " 얼굴 일관성: " + face
+                + " 시간 일관성: " + temporal;
+    }
+
     private String defaultText(String source, String fallback) {
         if (source == null || source.isBlank()) {
             return fallback;
         }
         return source;
+    }
+
+    private static double round3(double value) {
+        return Math.round(Math.max(0.0, Math.min(1.0, value)) * 1000.0) / 1000.0;
     }
 }

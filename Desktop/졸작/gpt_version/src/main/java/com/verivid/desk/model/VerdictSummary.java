@@ -5,7 +5,12 @@ import java.util.List;
 public record VerdictSummary(
         String verdict,
         double aiProbability,
+        double aiGeneratedProbability,
+        double deepfakeProbability,
+        double editedProbability,
+        double realCameraProbability,
         double confidence,
+        String confidenceCapReason,
         String shortSummary,
         List<String> analysisProcess,
         List<String> primarySignals,

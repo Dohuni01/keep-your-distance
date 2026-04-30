@@ -8,6 +8,8 @@ public record GptFrameFinding(
         double suspicious_score,
         String observed_area,
         String short_note,
+        String face_consistency,
+        String temporal_consistency,
         List<String> cues,
         List<String> counter_cues,
         String metric_interpretation,

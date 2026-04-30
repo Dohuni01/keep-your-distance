@@ -103,7 +103,7 @@ public class OpenAiVisionService {
                 if (includeHeatmapsInPrompt) {
                     content.add(Map.of(
                             "type", "input_text",
-                            "text", "Heatmap for previous frame. This is a frame-difference overlay, not direct proof of AI generation. Use it only to explain motion/change together with the raw frame."
+                            "text", "Temporal-difference heatmap for this sample frame. Bright/colored regions show pixel changes against the adjacent sampled frame. This is not direct proof of AI generation; use it only with the raw frame, face consistency, and temporal consistency evidence."
                     ));
                     content.add(Map.of(
                             "type", "input_image",
@@ -116,7 +116,7 @@ public class OpenAiVisionService {
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("model", model);
             payload.put("store", false);
-            payload.put("max_output_tokens", 6000);
+            payload.put("max_output_tokens", 8000);
             payload.put("input", List.of(Map.of(
                     "role", "user",
                     "content", content
@@ -236,6 +236,19 @@ public class OpenAiVisionService {
                                boolean includeHeatmapsInPrompt) {
         StringBuilder prompt = new StringBuilder();
         prompt.append(baseInstructions).append("\n\n");
+        prompt.append("입력 메타데이터\n");
+        prompt.append("- 파일명: ").append(originalFilename).append("\n");
+        prompt.append("- 영상 길이(초): ").append(metadata.durationSeconds()).append("\n");
+        prompt.append("- 해상도: ").append(metadata.width()).append("x").append(metadata.height()).append("\n");
+        prompt.append("- FPS: ").append(metadata.frameRate()).append("\n");
+        prompt.append("- 코덱: ").append(metadata.codec()).append("\n");
+        prompt.append("- 샘플 프레임 수: ").append(frames.size()).append("\n");
+        prompt.append("- heatmap evidence 포함: ").append(includeHeatmapsInPrompt).append("\n\n");
+        prompt.append("프레임은 시간순입니다. 각 프레임의 보조 수치는 인접한 샘플 프레임과 비교한 값입니다.\n");
+        prompt.append("전체 장면 AI 생성과 얼굴 교체/딥페이크를 반드시 구분해서 평가하세요.\n");
+        prompt.append("face_consistency에는 얼굴, 눈, 입, 치아, 턱선, 머리카락 경계의 일관성을 쓰세요.\n");
+        prompt.append("temporal_consistency에는 raw frame과 heatmap evidence가 보여주는 시간 변화가 자연스러운지 쓰세요.\n");
+        prompt.append("증거가 약하거나 입력 품질이 제한적이면 confidence를 낮추고 confidence_cap_reason에 명시하세요.\n\n");
         prompt.append("입력 메타데이터\n");
         prompt.append("- 파일명: ").append(originalFilename).append("\n");
         prompt.append("- 영상 길이(초): ").append(metadata.durationSeconds()).append("\n");

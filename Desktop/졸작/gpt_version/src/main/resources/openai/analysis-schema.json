@@ -5,8 +5,10 @@
     "verdict": {
       "type": "string",
       "enum": [
-        "AI_SUSPECTED",
         "LIKELY_REAL",
+        "AI_GENERATED",
+        "FACE_SWAP_OR_DEEPFAKE",
+        "EDITED_OR_COMPOSITED",
         "INCONCLUSIVE"
       ]
     },
@@ -15,10 +17,33 @@
       "minimum": 0,
       "maximum": 1
     },
+    "ai_generated_probability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "deepfake_probability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "edited_probability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "real_camera_probability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
     "confidence": {
       "type": "number",
       "minimum": 0,
       "maximum": 1
+    },
+    "confidence_cap_reason": {
+      "type": "string"
     },
     "short_summary": {
       "type": "string"
@@ -97,6 +122,12 @@
           "short_note": {
             "type": "string"
           },
+          "face_consistency": {
+            "type": "string"
+          },
+          "temporal_consistency": {
+            "type": "string"
+          },
           "cues": {
             "type": "array",
             "items": {
@@ -128,6 +159,8 @@
           "suspicious_score",
           "observed_area",
           "short_note",
+          "face_consistency",
+          "temporal_consistency",
           "cues",
           "counter_cues",
           "metric_interpretation",
@@ -139,7 +172,12 @@
   "required": [
     "verdict",
     "ai_probability",
+    "ai_generated_probability",
+    "deepfake_probability",
+    "edited_probability",
+    "real_camera_probability",
     "confidence",
+    "confidence_cap_reason",
     "short_summary",
     "analysis_process",
     "primary_signals",

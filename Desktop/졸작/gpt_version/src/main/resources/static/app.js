@@ -119,6 +119,7 @@ async function loadConfig() {
         els.frameCount.value = state.config.defaultFrameCount;
         els.frameCount.max = state.config.maxFrameCount;
         els.imageDetail.value = state.config.defaultImageDetail;
+        els.includeHeatmaps.checked = true;
         els.model.placeholder = `비워두면 서버 기본 모델 사용 (${state.config.defaultModel})`;
     } catch (_) {
     }
@@ -360,6 +361,9 @@ async function readError(response) {
 function verdictHeadline(verdict) {
     switch (verdict) {
         case 'AI_SUSPECTED':
+        case 'AI_GENERATED':
+        case 'FACE_SWAP_OR_DEEPFAKE':
+        case 'EDITED_OR_COMPOSITED':
             return 'AI 생성/합성 의심이 비교적 높게 나타났습니다.';
         case 'LIKELY_REAL':
             return '실제 촬영 영상일 가능성이 더 높아 보입니다.';
@@ -371,7 +375,12 @@ function verdictHeadline(verdict) {
 function toVerdictLabel(verdict) {
     switch (verdict) {
         case 'AI_SUSPECTED':
+        case 'AI_GENERATED':
             return 'AI 의심';
+        case 'FACE_SWAP_OR_DEEPFAKE':
+            return '딥페이크 의심';
+        case 'EDITED_OR_COMPOSITED':
+            return '편집/합성 의심';
         case 'LIKELY_REAL':
             return '실사 가능성 높음';
         default:
