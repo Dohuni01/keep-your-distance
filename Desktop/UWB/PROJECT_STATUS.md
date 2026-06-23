@@ -110,13 +110,59 @@ _2026-06-23 시니어 임베디드/풀스택 리뷰 결과. 상세는 ROADMAP.md
 
 ```
 UWB/
-├── Anchor/ancher_v1/ancher_v1.ino   Anchor 펌웨어 (현재 Phase 2-B)
-├── Tag/tag_v1/tag_v1.ino            Tag 펌웨어 (Phase 2-A)
+├── Anchor/ancher_v1/ancher_v1.ino   Anchor 펌웨어 (Phase A·B 반영)
+├── Tag/tag_v1/tag_v1.ino            Tag 펌웨어 (Phase A C2 반영)
 ├── dashboard/                       Mock 대시보드 (index.html, style.css, script.js)
+├── tests/
+│   └── anchor_collision_test/       테스트 A — 다중 앵커 충돌 측정 도구
+│       ├── anchor_collision_test.ino   (프로덕션 무수정 별도 스케치)
+│       └── README.md                   실행 절차·판정 기준
 ├── PROJECT_STATUS.md                이 파일
-├── ROADMAP.md                       전체 로드맵 (Phase A~G 개정판)
+├── ROADMAP.md                       전체 로드맵 (Phase A~G + Scale-out)
 └── CLAUDE_CONTEXT.md                Claude 인스턴스용 컨텍스트
 ```
+
+---
+
+## 빌드/플래시 환경 (2026-06-23 확인)
+
+| 항목 | 상태 |
+|---|---|
+| `arduino-cli` (독립) | ❌ 미설치 |
+| IDE 번들 `arduino-cli` | ✅ `C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe` |
+| esp32 코어 | ✅ 3.3.7 (Latest 3.3.10) |
+| Dw3000 라이브러리 | ✅ `Documents\Arduino\libraries\Dw3000` |
+| PubSubClient | ❌ **미설치** — 프로덕션 앵커 컴파일에 필요 (테스트 A는 불필요) |
+| 테스트 A 스케치 컴파일 | ✅ 통과 (FQBN `esp32:esp32:esp32`, flash 22% / RAM 6%) |
+
+**프로덕션 플래시 전 처리 필요 (테스트 A 이후):**
+1. `PubSubClient by Nick O'Leary` 설치 (없으면 앵커 컴파일 실패)
+2. **esp32 코어 3.x WDT 시그니처** — `esp_task_wdt_init(WDT_TIMEOUT_S, true)`의
+   타임아웃 단위가 코어 3.x에서 초→밀리초로 바뀌어 의도와 다르게 동작할 소지. 실측 확인 필요.
+
+컴파일 예:
+```powershell
+$cli = "C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe"
+$lib = "$env:USERPROFILE\Documents\Arduino\libraries"
+& $cli compile --fqbn esp32:esp32:esp32 --libraries $lib "C:\Users\bbk\Desktop\UWB\tests\anchor_collision_test"
+```
+
+---
+
+## 🟡 Scale-out (100대 확장) — 2026-06-23 확장성 리뷰
+
+실제 목표는 현장 규모(앵커 10~50 / 태그 50~100). 리뷰 결론·결정:
+
+- **현재 구조는 "단일 셀 근접 PoC"로는 우수하나 사이트 전역 RTLS로 확장되는 구조가 아님.**
+- 1순위 병목 = **UWB 단일 채널 충돌**(MAC 없음). WiFi/MQTT는 2차.
+- 핵심 재정의: **RTLS가 아니라 근접(proximity)**. 100명 추적 불필요.
+- 공존 순서: **공간재사용 → 2채널(ch5/9) → (측정이 강요할 때만) TDMA**.
+- 태그: **하이브리드**(blink=발견, 앵커 능동 폴링=안전). 순수 tag-initiated는 거짓안전 위험.
+- 최대 위험: **양성감지 의존 + NLOS 금속 false-safe** — 차폐된 작업자를 "부재"로 오분류.
+- **측정 우선**: 테스트 A(충돌)/B(NLOS)/D(재사용거리)/E(채널분리)로 물리 한계부터 측정.
+  - 테스트 A 도구 완료(`tests/anchor_collision_test/`), 측정 대기.
+
+상세 단계는 `ROADMAP.md`의 **Scale-out 전략** 섹션 참조.
 
 ---
 

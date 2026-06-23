@@ -48,6 +48,20 @@ GPS 데이터는 Anchor의 지도 위치 표시에만 쓴다.
 안전 거리 측정은 UWB만 담당한다.
 GPS 신호 유무가 릴레이 동작에 영향을 주면 안 된다.
 
+### 4. 확장은 "근접(proximity)"으로, 안전 우선 (2026-06-23 확장성 리뷰)
+
+실제 목표는 현장 규모(앵커 10~50 / 태그 50~100)지만, 이는 **사이트 전역 RTLS가 아니라
+장비별 근접 감지**다. "이 장비 3m 안에 작업자?"만 답하면 되며 100명 추적은 불필요.
+
+확장 시 지켜야 할 결정:
+- **문제는 근접(proximity)으로 재정의** — 비용을 `전체A×전체T`가 아니라 `장비 × 근처 태그`로.
+- **공존 순서: 공간재사용 → 2채널(ch5/9) → (측정이 강요할 때만) TDMA.** TDMA를 미리 만들지 말 것.
+- **하이브리드 tag-initiated** — blink=발견, 근처 태그는 앵커가 능동 폴링(결정론적 안전).
+  순수 tag-initiated(blink 거리 추정)는 NLOS/충돌 시 거짓안전 위험이라 안전 시스템에 부적합.
+- **안전 vs 확장성 충돌 시 안전 우선.** 확장성은 영리한 프로토콜이 아니라 하드웨어(채널·앵커·작은 셀)로 되산다.
+- **측정 우선**: 확장 코드 전에 테스트 A(충돌)/B(NLOS)/D(재사용거리)/E(채널분리)로 물리 한계부터 잰다.
+  테스트 A 도구 = `tests/anchor_collision_test/` (프로덕션 무수정 별도 스케치).
+
 ---
 
 ## 핵심 설계 결정 및 이유
@@ -114,10 +128,11 @@ Tag는 MSG_TYPE + TAG_ID 두 필드만 검증 (어느 Anchor든 수락).
 
 | 파일 | 역할 |
 |---|---|
-| `Anchor/ancher_v1/ancher_v1.ino` | Anchor 펌웨어. Phase 2-B까지 구현됨 |
-| `Tag/tag_v1/tag_v1.ino` | Tag 펌웨어. Phase 2-A 상태 |
-| `PROJECT_STATUS.md` | 현재 구현 상태, 알려진 이슈, 플래시 방법 |
-| `ROADMAP.md` | 전체 단계별 계획 및 기술 스택 |
+| `Anchor/ancher_v1/ancher_v1.ino` | Anchor 펌웨어. Phase A(C1·C2)·B(적응형 폴링) 반영 |
+| `Tag/tag_v1/tag_v1.ino` | Tag 펌웨어. Phase A C2(RX 타임아웃) 반영 |
+| `tests/anchor_collision_test/` | 테스트 A — 다중 앵커 충돌 측정 도구 (프로덕션 무수정 별도 스케치) |
+| `PROJECT_STATUS.md` | 현재 구현 상태, 빌드 환경, 알려진 이슈, Scale-out 리뷰 |
+| `ROADMAP.md` | 전체 단계별 계획 + Scale-out 전략 |
 | `CLAUDE.md` | Arduino 빌드/플래시 명령, 핀 배열 등 |
 
 ---
