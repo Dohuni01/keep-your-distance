@@ -130,7 +130,7 @@ Tag는 MSG_TYPE + TAG_ID 두 필드만 검증 (어느 Anchor든 수락).
 |---|---|---|---|
 | C1 | 5-샘플 이동평균 = 약 3초 탐지 지연 (정지가 늦음) | `ancher_v1.ino:122` | A |
 | C2 | 태그 RX 타임아웃 없는 무한 스핀 → 앵커 부재 시 10초마다 리부트 | `tag_v1.ino:90-93` | A |
-| C3 | 앵커 간 RF 조율 없음 → 5대 동시 폴링 시 충돌 | 프로토콜 전반 | B |
+| C3 | 앵커 간 RF 조율 없음 → 다중 앵커 시 충돌 | 프로토콜 전반 | **N/A** (1앵커 고정) |
 | C4 | 타임스탬프가 `millis()`(가동시간), epoch 아님 | 모든 MQTT payload | C |
 | C5 | 안테나 딜레이 미교정 (±10~30cm) | `TX/RX_ANT_DLY 16385` | A |
 
@@ -143,8 +143,8 @@ C2 주의: PROJECT_STATUS의 "Tag WDT 리부트"는 "의도된 동작"으로 적
 기존 "GPS → 백엔드 → 대시보드" 순서는 폐기.
 **안전 정확성이 모니터링보다 먼저**라는 원칙으로 재배치:
 
-1. 🔴 **Phase A — 안전 정확성**: C1(비대칭 median), C2(태그 RX 타임아웃), C5(안테나 교정)
-2. 🔴 **Phase B — 다중 앵커 RF 공존**: 채널 분리 or LBT
+1. ✅ **Phase A — 안전 정확성**: C1(비대칭 median) + C2(태그 RX 타임아웃) 코드 완료, C5 교정 SOP 주석화(실측 대기)
+2. ✅ **Phase B — 적응형 폴링**: C3 N/A(1앵커 고정). `absentCount`/`pollSkip` dead-tag 슬로 폴링 구현 완료
 3. **Phase C — 필드급 펌웨어 신뢰성**: NTP, ArduinoJson, clientId, 동적 태그, 이벤트 버퍼, TLS
 4. **Phase D — 백엔드 + DB**: Postgres(마스터/이벤트) + Influx(시계열, retention), 인증, staleness
 5. **Phase E — 대시보드 실연동**: `USE_MOCK=false`, staleness UI, STOP/RUN 우선
