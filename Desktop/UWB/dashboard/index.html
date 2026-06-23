@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3m Safety Monitoring System</title>
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <!-- Font Awesome -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
+  <!-- Dashboard CSS -->
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ══════════════════════════════════
+       HEADER
+  ══════════════════════════════════ -->
+  <header id="app-header">
+    <div class="header-left">
+      <div class="logo">
+        <i class="fas fa-shield-halved"></i>
+      </div>
+      <div class="header-title">
+        <h1>3m Safety Monitoring System</h1>
+        <p class="header-subtitle">Construction Site UWB Dashboard</p>
+      </div>
+    </div>
+
+    <div class="header-center">
+      <div class="live-pill">
+        <span class="live-dot"></span>
+        <span>LIVE</span>
+      </div>
+      <div id="current-time" class="current-time">--:--:--</div>
+    </div>
+
+    <div class="header-right">
+      <div class="status-badge" id="server-badge">
+        <i class="fas fa-server"></i>
+        <span class="status-dot" id="server-dot"></span>
+        <span>Server</span>
+        <strong id="server-status-text">Offline</strong>
+      </div>
+      <div class="status-badge" id="mqtt-badge">
+        <i class="fas fa-rss"></i>
+        <span class="status-dot" id="mqtt-dot"></span>
+        <span>MQTT</span>
+        <strong id="mqtt-status-text">Disconnected</strong>
+      </div>
+    </div>
+  </header>
+
+  <!-- ══════════════════════════════════
+       MAIN LAYOUT
+  ══════════════════════════════════ -->
+  <main id="app-main">
+
+    <!-- ── 좌측 사이드바: Anchor 목록 + 통계 ── -->
+    <aside class="sidebar sidebar-left">
+
+      <div class="sidebar-section">
+        <div class="section-header">
+          <div class="section-title">
+            <i class="fas fa-tower-broadcast"></i>
+            <h2>Anchors</h2>
+          </div>
+          <span class="count-badge" id="anchor-count-badge">0</span>
+        </div>
+        <div id="anchor-list" class="anchor-list"></div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="section-header">
+          <div class="section-title">
+            <i class="fas fa-chart-bar"></i>
+            <h2>Statistics</h2>
+          </div>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-icon blue"><i class="fas fa-tower-broadcast"></i></div>
+            <div class="stat-body">
+              <div class="stat-value" id="stat-anchors">0</div>
+              <div class="stat-label">Total Anchors</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon green"><i class="fas fa-person-walking"></i></div>
+            <div class="stat-body">
+              <div class="stat-value" id="stat-tags">0</div>
+              <div class="stat-label">Total Tags</div>
+            </div>
+          </div>
+          <div class="stat-card" id="stat-card-danger">
+            <div class="stat-icon red"><i class="fas fa-triangle-exclamation"></i></div>
+            <div class="stat-body">
+              <div class="stat-value" id="stat-dangers">0</div>
+              <div class="stat-label">In Danger</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon orange"><i class="fas fa-calendar-day"></i></div>
+            <div class="stat-body">
+              <div class="stat-value" id="stat-events">0</div>
+              <div class="stat-label">Today's Events</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="section-header">
+          <div class="section-title">
+            <i class="fas fa-person-walking"></i>
+            <h2>Tags</h2>
+          </div>
+          <span class="count-badge" id="tag-count-badge">0</span>
+        </div>
+        <div id="tag-list" class="tag-list"></div>
+      </div>
+
+    </aside>
+
+    <!-- ── 중앙: Leaflet 지도 ── -->
+    <section class="map-section">
+      <div id="map"></div>
+
+      <!-- 범례 -->
+      <div class="map-overlay map-legend">
+        <div class="legend-title"><i class="fas fa-circle-info"></i> Legend</div>
+        <div class="legend-item">
+          <div class="legend-dot" style="background:#1f6feb;"></div>
+          <span>Normal Anchor</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-dot" style="background:#b91c1c;"></div>
+          <span>Danger Anchor</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-zone-icon"></div>
+          <span>3m Safety Zone</span>
+        </div>
+        <div class="legend-separator"></div>
+        <div class="legend-item">
+          <div class="legend-tag-dot safe"></div>
+          <span>Safe Worker</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-tag-dot danger"></div>
+          <span>Danger Worker</span>
+        </div>
+      </div>
+
+      <!-- 마지막 업데이트 -->
+      <div class="map-overlay map-update-bar">
+        <i class="fas fa-rotate" id="update-icon"></i>
+        <span id="last-update-text">연결 대기 중...</span>
+      </div>
+    </section>
+
+    <!-- ── 우측 사이드바: 위험 목록 + 이벤트 로그 ── -->
+    <aside class="sidebar sidebar-right">
+
+      <div class="sidebar-section">
+        <div class="section-header">
+          <div class="section-title danger-title">
+            <i class="fas fa-triangle-exclamation"></i>
+            <h2>Active Dangers</h2>
+          </div>
+          <span class="count-badge danger-badge" id="danger-count-badge">0</span>
+        </div>
+        <div id="danger-list" class="danger-list">
+          <div class="empty-state" id="no-danger-msg">
+            <i class="fas fa-shield-check"></i>
+            <p>현재 위험 없음</p>
+            <small>All workers safe</small>
+          </div>
+        </div>
+      </div>
+
+      <div class="sidebar-section flex-grow-section">
+        <div class="section-header">
+          <div class="section-title">
+            <i class="fas fa-clock-rotate-left"></i>
+            <h2>Event Log</h2>
+          </div>
+          <button class="icon-btn" id="clear-log-btn" title="로그 초기화">
+            <i class="fas fa-trash-can"></i>
+          </button>
+        </div>
+        <div id="event-log" class="event-log">
+          <div class="empty-state" id="no-events-msg">
+            <i class="fas fa-list-check"></i>
+            <p>이벤트 없음</p>
+          </div>
+        </div>
+      </div>
+
+    </aside>
+  </main>
+
+  <!-- ══════════════════════════════════
+       TOAST 알림 컨테이너
+  ══════════════════════════════════ -->
+  <div id="toast-container"></div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- Dashboard Script -->
+  <script src="script.js"></script>
+</body>
+</html>
