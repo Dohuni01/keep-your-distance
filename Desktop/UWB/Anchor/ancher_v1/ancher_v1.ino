@@ -29,14 +29,26 @@ static const int     NUM_TAGS  = sizeof(TAG_IDS) / sizeof(TAG_IDS[0]);
 #define RNG_DELAY_MS       150
 
 /* ── DW3000 타이밍 ── */
+/* ⚠️ 안테나 딜레이 교정 (리뷰 C5) — 미교정 시 ±10~30cm 오차, 3m 임계값에서 늦은 정지 위험.
+ *    2점 교정 SOP:
+ *      1) 태그를 정확히 알려진 거리(예: 2.00m, 5.00m)에 고정
+ *      2) 시리얼 raw 거리 평균을 읽어 오차(측정-실제) 계산
+ *      3) 오차 1cm ≈ ANT_DLY 약 0.5 LSB. 측정이 멀게 나오면 ANT_DLY를 키움
+ *      4) TX_ANT_DLY = RX_ANT_DLY 동일 적용, 두 거리에서 모두 ±5cm 들도록 반복
+ *    교정값은 보드(안테나)마다 다르므로 디바이스별로 따로 둘 것. */
 #define TX_ANT_DLY              16385
 #define RX_ANT_DLY              16385
 #define POLL_TX_TO_RESP_RX_DLY_UUS 240
 #define RESP_RX_TIMEOUT_UUS        3000
 
-/* ── 워치독 / 필터 ── */
-#define WDT_TIMEOUT_S    15
-#define DIST_FILTER_SIZE  5
+/* ── 워치독 / 필터 ──
+ * 비대칭 median 필터 (리뷰 C1):
+ *   진입(릴레이 ON) = 최근 ENTER_FILTER_SIZE개 median → 빠른 반응
+ *   이탈(릴레이 OFF) = 최근 DIST_FILTER_SIZE개 median → 신중 (멀티패스 스파이크 내성)
+ * median은 평균과 달리 단발 스파이크에 끌려가지 않는다. */
+#define WDT_TIMEOUT_S      15
+#define DIST_FILTER_SIZE    5   /* 이탈/표시용 윈도우 */
+#define ENTER_FILTER_SIZE   3   /* 진입용 윈도우 (빠른 안전 반응) */
 
 /* ── 프레임 필드 인덱스 ──
  *  [0-1] 프레임 타입  [2] SEQ  [3-4] PAN ID
@@ -119,14 +131,34 @@ portMUX_TYPE       g_reportMux          = portMUX_INITIALIZER_UNLOCKED;
  *  UWB 안전 함수 (Core 1 전용)
  * ════════════════════════════════════════════════════════ */
 
-static double applyFilter(TagState &t, double raw)
+/* 링 버퍼에 raw 1개 push */
+static void pushSample(TagState &t, double raw)
 {
   t.distBuf[t.distIdx] = raw;
   t.distIdx = (t.distIdx + 1) % DIST_FILTER_SIZE;
   if (t.distCount < DIST_FILTER_SIZE) t.distCount++;
-  double sum = 0;
-  for (int i = 0; i < t.distCount; i++) sum += t.distBuf[i];
-  return sum / t.distCount;
+}
+
+/* 최근 n개 샘플의 median. n은 보유 샘플 수로 클램프.
+ * (멀티패스 스파이크 내성: 평균과 달리 단발 이상치에 끌려가지 않음) */
+static double medianOfLast(TagState &t, int n)
+{
+  if (n > t.distCount) n = t.distCount;
+  if (n <= 0) return -1.0;
+
+  double tmp[DIST_FILTER_SIZE];
+  for (int k = 0; k < n; k++) {
+    int idx = (t.distIdx - 1 - k + DIST_FILTER_SIZE * 2) % DIST_FILTER_SIZE;
+    tmp[k]  = t.distBuf[idx];
+  }
+  /* 삽입 정렬 (n ≤ 5) */
+  for (int i = 1; i < n; i++) {
+    double key = tmp[i];
+    int j = i - 1;
+    while (j >= 0 && tmp[j] > key) { tmp[j + 1] = tmp[j]; j--; }
+    tmp[j + 1] = key;
+  }
+  return tmp[n / 2];
 }
 
 static int  relayOnLevel()  { return RELAY_ACTIVE_LOW ? LOW  : HIGH; }
@@ -171,18 +203,24 @@ static void processTagDistance(int idx, double rawDist)
   if (rawDist <= 0.0 || rawDist > 30.0) return;
 
   t.noRangeCount = 0;
-  double filtered = applyFilter(t, rawDist);
-  t.lastFiltered  = filtered;
+  pushSample(t, rawDist);
+
+  /* 비대칭 필터 (리뷰 C1):
+   *   enterDist = 짧은 윈도우 median → 위험 진입을 빠르게 감지 (안전은 빠르게)
+   *   exitDist  = 긴 윈도우 median  → 이탈/표시는 신중하게 (복구는 신중하게) */
+  double enterDist = medianOfLast(t, ENTER_FILTER_SIZE);
+  double exitDist  = medianOfLast(t, DIST_FILTER_SIZE);
+  t.lastFiltered   = exitDist;
 
   if (!t.inDanger) {
-    if (filtered <= ENTER_DISTANCE_M) {
+    if (enterDist <= ENTER_DISTANCE_M) {
       t.inDanger     = true;
       t.outsideCount = 0;
-      Serial.printf("[Tag#%d] DANGER ENTER %.2fm -> RELAY ON\n", t.id, filtered);
+      Serial.printf("[Tag#%d] DANGER ENTER %.2fm -> RELAY ON\n", t.id, enterDist);
       setRelay(true);
     }
   } else {
-    if (filtered >= EXIT_DISTANCE_M) {
+    if (exitDist >= EXIT_DISTANCE_M) {
       t.outsideCount++;
       Serial.printf("[Tag#%d] outsideCount: %d\n", t.id, t.outsideCount);
       if (t.outsideCount >= CONFIRM_OFF_COUNT) {
@@ -501,6 +539,7 @@ void setup()
   Serial.printf( "UWB ANCHOR #%d  (Phase 2-B)\n", ANCHOR_ID);
   Serial.printf( "Tags     : %d\n", NUM_TAGS);
   Serial.printf( "Safety   : %.1fm / %.1fm (enter/exit)\n", ENTER_DISTANCE_M, EXIT_DISTANCE_M);
+  Serial.printf( "Filter   : median asym (enter=%d, exit=%d)\n", ENTER_FILTER_SIZE, DIST_FILTER_SIZE);
   Serial.printf( "Cycle    : %dms/tag  total %dms\n", RNG_DELAY_MS, NUM_TAGS * RNG_DELAY_MS);
   Serial.printf( "MQTT     : %s:%d\n", MQTT_BROKER, MQTT_PORT);
   Serial.println("=================================");
@@ -513,7 +552,12 @@ void setup()
     NULL, 1     /* Core 1 고정 */
   );
 
-  /* Core 0 — 네트워크 리포팅 (낮은 우선순위, 실패 무방) */
+  /* Core 0 — 네트워크 리포팅 (낮은 우선순위, 실패 무방)
+   *
+   * SAFETY: taskNetwork는 의도적으로 panic WDT에 등록하지 않는다.
+   *   panic=true WDT에 묶으면 네트워크 hang(DNS/소켓 지연)이 칩 전체를
+   *   리부트시켜 Core 1 안전 루프까지 중단시킨다 — 안전 독립성 위배.
+   *   네트워크 hang은 socketTimeout(5s)+재연결 로직으로 자체 복구한다. */
   xTaskCreatePinnedToCore(
     taskNetwork, "Network",
     8192,        /* WiFi/TLS 스택 고려해 여유있게 */

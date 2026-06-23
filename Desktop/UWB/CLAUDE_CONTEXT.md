@@ -22,6 +22,19 @@ Core 0의 `taskNetwork`는 데이터를 읽기만 한다.
 
 이 원칙을 깨는 코드는 어떤 이유로도 작성하지 않는다.
 
+### 1-A. 안전은 빠르게, 복구는 신중하게 (비대칭)
+
+위험 **진입**(릴레이 ON)은 최대한 빠른 신호로 판정한다 (raw 또는 median(3)).
+위험 **이탈**(릴레이 OFF)은 디바운스된 신중한 신호로 판정한다 (median(5) + CONFIRM_OFF_COUNT).
+긴 이동평균을 진입 판정에 쓰면 정지가 늦어진다 (리뷰 발견 C1).
+필터는 멀티패스 스파이크에 강한 **median**을 쓴다. 평균은 스파이크에 끌려간다.
+
+### 1-B. 이벤트 판정 권위는 앵커에 있다
+
+"위험 진입/이탈" 이벤트의 진실 원천은 **앵커**다 (디바운스·교정된 값으로 실제 릴레이를 제어).
+대시보드나 백엔드가 거리로 위험을 **재계산**하면 안 된다.
+권위 체인: **앵커가 판정·타임스탬프 → 브로커 전송 → 백엔드 영속화 → 대시보드 표시.**
+
 ### 2. 공유 데이터는 단방향
 
 `g_tagReports`, `g_relayState`, `g_reportTimestamp`는
@@ -109,20 +122,47 @@ Tag는 MSG_TYPE + TAG_ID 두 필드만 검증 (어느 Anchor든 수락).
 
 ---
 
-## 현재 미구현 (다음 작업 대상)
+## 현재 알려진 중요 결함 (2026-06-23 리뷰)
 
-우선순위 순서:
-1. **Phase 2-C**: GPS 모듈 연결 — NEO-6M, UART(GPIO16/17), TinyGPS++ 라이브러리
-2. **Phase 3**: Node.js 백엔드 + Mosquitto 브로커 설치 (VPS)
-3. **Phase 4**: Leaflet.js 웹 대시보드
-4. **Phase 5**: Tag 절전, OTA, 2단계 경보 구역
+작업 전 반드시 인지할 것. 상세·우선순위는 ROADMAP.md / PROJECT_STATUS.md 참조.
+
+| ID | 결함 | 위치 | 단계 |
+|---|---|---|---|
+| C1 | 5-샘플 이동평균 = 약 3초 탐지 지연 (정지가 늦음) | `ancher_v1.ino:122` | A |
+| C2 | 태그 RX 타임아웃 없는 무한 스핀 → 앵커 부재 시 10초마다 리부트 | `tag_v1.ino:90-93` | A |
+| C3 | 앵커 간 RF 조율 없음 → 5대 동시 폴링 시 충돌 | 프로토콜 전반 | B |
+| C4 | 타임스탬프가 `millis()`(가동시간), epoch 아님 | 모든 MQTT payload | C |
+| C5 | 안테나 딜레이 미교정 (±10~30cm) | `TX/RX_ANT_DLY 16385` | A |
+
+C2 주의: PROJECT_STATUS의 "Tag WDT 리부트"는 "의도된 동작"으로 적혀 있었으나
+실제로는 **수정 대상 결함**이다. 태그에 `dwt_setrxtimeout` + re-arm 루프를 넣어
+앵커 부재를 정상 idle로 처리해야 한다.
+
+## 현재 미구현 (다음 작업 대상 — 개정된 우선순위)
+
+기존 "GPS → 백엔드 → 대시보드" 순서는 폐기.
+**안전 정확성이 모니터링보다 먼저**라는 원칙으로 재배치:
+
+1. 🔴 **Phase A — 안전 정확성**: C1(비대칭 median), C2(태그 RX 타임아웃), C5(안테나 교정)
+2. 🔴 **Phase B — 다중 앵커 RF 공존**: 채널 분리 or LBT
+3. **Phase C — 필드급 펌웨어 신뢰성**: NTP, ArduinoJson, clientId, 동적 태그, 이벤트 버퍼, TLS
+4. **Phase D — 백엔드 + DB**: Postgres(마스터/이벤트) + Influx(시계열, retention), 인증, staleness
+5. **Phase E — 대시보드 실연동**: `USE_MOCK=false`, staleness UI, STOP/RUN 우선
+6. **Phase F — 측위/GPS**: 고정 장비는 측량 좌표, 방위는 PDOA/삼변측량 필요
+7. **Phase G — 강화/법규**: 절전, OTA, 2단계 구역, PIPA(위치=개인정보)
 
 ---
 
 ## 주의사항
 
 - `PubSubClient` 기본 최대 메시지 크기 = 256바이트. 현재 페이로드는 이 안에 들어옴
+- `PubSubClient`는 **publish QoS0만** 지원. relay 전이도 fire-and-forget이므로
+  소비자(백엔드/대시보드)는 retain 값 + timestamp + staleness로 진실을 판단해야 함 (전달 보장에 의존 금지)
 - `taskNetwork` 스택 = 8192 (WiFi 내부 TLS 스택 고려). 줄이지 말 것
-- 태그 등록은 현재 컴파일 타임 고정 (`TAG_IDS[]`). 런타임 동적 등록은 Phase 5 이후 검토
-- 안테나 딜레이(16385)는 미교정 기본값. 실측 교정 전까지 거리 오차 ±10~30cm 예상
+- 태그 등록은 현재 컴파일 타임 고정 (`TAG_IDS[]`). 동적 레지스트리는 Phase C
+- 안테나 딜레이(16385)는 미교정 기본값. 실측 교정 전까지 거리 오차 ±10~30cm 예상 (Phase A 교정)
 - `WIFI_SSID`, `WIFI_PASSWORD`, `MQTT_BROKER`는 `ancher_v1.ino` 상단 define에서 수정
+- MQTT 현재 평문 1883. 운영 전 TLS(8883) 전환 (Phase C)
+- payload `ts`는 현재 `millis()`(가동시간). epoch 아님 — 백엔드에서 수신 시각 별도 기록, Phase C에서 NTP 도입
+- GPS(GPIO16/17) 연결 전 보드 변종 확인 — ESP32-WROVER는 해당 핀이 PSRAM과 충돌
+- 시스템은 **거리만** 측정하고 방위(bearing)는 모름. 대시보드 태그 점 위치는 illustrative (방위는 PDOA/삼변측량 필요)

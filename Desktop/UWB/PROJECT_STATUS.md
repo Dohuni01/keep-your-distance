@@ -1,5 +1,5 @@
 # PROJECT_STATUS.md
-_Last updated: 2026-06-23_
+_Last updated: 2026-06-23 (기술 리뷰 반영)_
 
 ---
 
@@ -20,7 +20,8 @@ _Last updated: 2026-06-23_
 | 릴레이 핀 | GPIO26 (Anchor 전용) |
 | UWB 핀 | RST=27, IRQ=34, SS=4 |
 | SPI | 16MHz, MSBFIRST, SPI_MODE0 |
-| 안테나 딜레이 | TX/RX 각 16385 (미교정 상태) |
+| 안테나 딜레이 | TX/RX 각 16385 (**미교정 상태 — Phase A 교정 필요**) |
+| ⚠️ 보드 변종 | GPS(GPIO16/17) 연결 전 WROOM/WROVER 확인 필요 (WROVER는 PSRAM 충돌) |
 
 ---
 
@@ -32,7 +33,7 @@ _Last updated: 2026-06-23_
 - 시리얼 메시지 오류 수정 (`No range x5` → `x20`)
 - 미사용 `insideCount`, `CONFIRM_ON_COUNT` 제거
 - 워치독 타이머 15초 (Anchor) / 10초 (Tag)
-- 거리 이동 평균 필터 5회 (유효값만 누적)
+- 거리 이동 평균 필터 5회 (유효값만 누적) ← **Phase A에서 비대칭 median으로 교체 예정**
 - 부팅 시 Relay OFF 보장
 
 ### ✅ Phase 2-A — 다중 태그 UWB 프로토콜 (완료)
@@ -44,24 +45,61 @@ _Last updated: 2026-06-23_
 - 릴레이: 태그 하나라도 위험 → ON / 전부 안전 → OFF
 - Tag가 senderAnchorId를 echo → 향후 다중 앵커 대응 가능
 
-### ✅ 안전 독립성 설계 (완료)
+### ✅ 안전 독립성 설계 (완료, 핵심 강점)
 
 - FreeRTOS 이중 코어 분리
   - Core 1: `taskUWB` (우선순위 2) — UWB + GPIO26 전담
   - Core 0: `taskNetwork` (우선순위 1) — WiFi + MQTT 전담
-- portMUX로 공유 데이터 보호
+- portMUX로 공유 데이터 보호 (단방향: Core1 쓰기 / Core0 읽기)
 - 네트워크 장애가 UWB 안전 루프에 영향 없음을 구조적으로 보장
 - WDT를 `taskUWB` 내부에서 등록 (setup 태스크 삭제 후 WDT 오동작 방지)
 
 ### ✅ Phase 2-B — WiFi + MQTT (완료)
 
-- `taskNetwork`에 WiFi 연결 + 자동 재연결 구현
+- `taskNetwork`에 WiFi 연결 + 자동 재연결
 - PubSubClient 기반 MQTT publish
-- LWT(Last Will Testament) 설정 — 비정상 종료 시 브로커가 offline 발행
-- 릴레이 상태 변경 즉시 publish (retain=true)
-- 거리 데이터 1초 주기 publish
-- 헬스체크(status) 30초 주기 publish (retain=true)
-- MQTT 재연결 5초 간격, 비차단(non-blocking)
+- LWT(Last Will Testament) — 비정상 종료 시 브로커가 offline 발행
+- 릴레이 변경 즉시 publish (retain=true) / 거리 1초 / status 30초 (retain=true)
+
+### ✅ 대시보드 Mock UI (완료, 실데이터 미연동)
+
+- Leaflet 다크 지도, Anchor 5 + Tag 20 마커
+- 좌측 Anchor/Tag 목록 + 통계, 우측 위험 목록 + 이벤트 로그
+- `DataSource` 추상화 — `USE_MOCK` 플래그로 실연동 전환 준비됨
+- ⚠️ 태그 지도 좌표는 앵커 주변 **가짜 오프셋** (방위 데이터 없음)
+
+---
+
+## 🔴 기술 리뷰 발견 — 우선 수정 대상 (Critical)
+
+_2026-06-23 시니어 임베디드/풀스택 리뷰 결과. 상세는 ROADMAP.md Phase A~D 참조._
+
+| ID | 발견 | 위치 | 영향 | 단계 | 상태 |
+|---|---|---|---|---|---|
+| **C1** | 5-샘플 이동평균 = 약 3초 탐지 지연 | `ancher_v1.ino` | 1.5m/s 접근 시 ~4.5m 좁혀진 뒤 탐지. **정지가 늦음** | A | ✅ 코드 수정 (비대칭 median, 진입 3 / 이탈 5) |
+| **C2** | 태그 RX 타임아웃 없는 무한 스핀 | `tag_v1.ino` | 앵커 부재 시 10초마다 리부트(배터리·가용성 손실) | A | ✅ 코드 수정 (`dwt_setrxtimeout` + re-arm) |
+| **C3** | 앵커 간 RF 조율 없음 | 프로토콜 전반 (단일 채널 5) | 앵커 5대 동시 폴링 시 충돌 → 거짓 no-range | B | ⬜ 미착수 |
+| **C4** | 타임스탬프가 `millis()`(가동시간) | 모든 MQTT payload | 앵커 간 상관·리부트 후 추적 불가 → 컴플라이언스 로그 무력 | C | ⬜ 미착수 |
+| **C5** | 안테나 딜레이 미교정 (±10~30cm) | `TX/RX_ANT_DLY 16385` | 3m 임계값에서 절반은 **늦게** 정지 | A | 🟡 2점 교정 SOP 주석화, 실측 교정은 하드웨어 필요 |
+
+> **Phase A 코드 적용 완료 (2026-06-23)** — C1·C2는 펌웨어 반영, C5는 교정 SOP 주석 추가.
+> 모두 **하드웨어 실측 검증 대기** (`arduino-cli` 미설치로 본 환경 컴파일 미수행).
+> 추가: `taskNetwork`는 의도적으로 panic WDT에 등록하지 않음(안전 독립성) — 코드 주석화.
+
+### 추가 발견 (High/Medium)
+
+- **멀티패스 취약**: 평균 필터가 스파이크에 약함 → median 권장 (A)
+- **보안 레인징 부재**: STS OFF, 프레임 무인증 → 거리 단축 공격 가능 (A 검토)
+- **`taskNetwork` WDT 미감시**: 네트워크 태스크 hang 미탐지 (A)
+- **PubSubClient QoS0 only**: relay 전이가 fire-and-forget, 브로커 blip 시 손실 (C/D — staleness로 보완)
+- **MQTT 평문(1883)**: 자격증명·위치 노출 → TLS 필요 (C)
+- **손수 짠 JSON**: NaN/inf 시 파싱 깨짐 → ArduinoJson (C)
+- **clientId 충돌**: 동일 ANCHOR_ID 시 브로커 강퇴 → MAC 추가 (C)
+- **태그 정적 등록**: `TAG_IDS[]` 컴파일타임 → 동적 레지스트리 (C)
+- **백엔드 단일 장애점 + store-and-forward 부재**: 다운 중 이벤트 로그 공백 (C/D)
+- **이벤트 권위 모호**: 앵커가 판정해야 함, 대시보드 재계산 금지 (D)
+- **대시보드 staleness 미표시**: 멈춘 화면이 "전부 안전"처럼 보임 (E)
+- **태그 지도 위치 허구**: 방위 데이터 없음 → 거리 링/목록으로 정직화 (F)
 
 ---
 
@@ -71,8 +109,9 @@ _Last updated: 2026-06-23_
 UWB/
 ├── Anchor/ancher_v1/ancher_v1.ino   Anchor 펌웨어 (현재 Phase 2-B)
 ├── Tag/tag_v1/tag_v1.ino            Tag 펌웨어 (Phase 2-A)
+├── dashboard/                       Mock 대시보드 (index.html, style.css, script.js)
 ├── PROJECT_STATUS.md                이 파일
-├── ROADMAP.md                       전체 로드맵
+├── ROADMAP.md                       전체 로드맵 (Phase A~G 개정판)
 └── CLAUDE_CONTEXT.md                Claude 인스턴스용 컨텍스트
 ```
 
@@ -81,19 +120,17 @@ UWB/
 ## MQTT 토픽 구조 (현재)
 
 ```
-uwb/anchor/{id}/tag/{tag_id}/range  — 거리 데이터, 1초 주기
-uwb/anchor/{id}/relay               — 릴레이 상태, 변경 즉시, retain
-uwb/anchor/{id}/status              — 헬스체크, 30초 주기, retain
+uwb/anchor/{id}/tag/{tag_id}/range  — 거리 데이터, 1초 주기, retain=false
+uwb/anchor/{id}/relay               — 릴레이 상태, 변경 즉시, retain=true
+uwb/anchor/{id}/status              — 헬스체크, 30초 주기, retain=true
 ```
 
-페이로드 예시:
+페이로드 예시 (⚠️ `ts`는 현재 epoch가 아닌 `millis()` — Phase C에서 교정):
 ```json
 // range
 {"raw":2.85,"filt":2.90,"danger":false,"ts":123456}
-
 // relay
 {"state":true,"ts":123456}
-
 // status
 {"online":true,"anchor_id":1,"tags":4,"uptime":360,"ts":123456}
 ```
@@ -107,19 +144,19 @@ uwb/anchor/{id}/status              — 헬스체크, 30초 주기, retain
 | 태그 1개당 폴링 간격 | 150ms |
 | 전체 사이클 (태그 4개) | 600ms |
 | 각 태그 측정 주기 | ~1.67Hz |
-| RX 타임아웃 | 3ms |
+| RX 타임아웃 (Anchor) | 3ms |
+| ⚠️ 필터 윈도우 실질 지연 | 5 × 600ms ≈ **3초** (C1) |
 
 ---
 
-## 알려진 한계 / 미해결 사항
+## 다음 작업 (우선순위)
 
-| # | 항목 | 내용 |
-|---|---|---|
-| 1 | 안테나 딜레이 미교정 | TX/RX ANT DLY = 16385 기본값. 실측 교정 시 거리 정확도 향상 가능 |
-| 2 | 태그 정적 등록 | `TAG_IDS[]` 컴파일 타임 고정. 태그 추가 시 재플래시 필요 |
-| 3 | `g_reportTimestamp` | 기록되지만 대시보드 미구현으로 아직 미활용 |
-| 4 | Tag WDT | Anchor 전원 off 시 Tag spin-wait → WDT 재부팅. 의도된 동작이나 현장 확인 필요 |
-| 5 | GPS 미연결 | Phase 2-C에서 구현 예정. 현재 Anchor 위치 정보 없음 |
+1. 🔴 **Phase A — 안전 정확성**: C1(비대칭 median), C2(태그 RX 타임아웃), C5(안테나 교정)
+2. 🔴 **Phase B — 다중 앵커 RF**: 채널 분리 or LBT, 5보드 벤치 테스트
+3. **Phase C — 펌웨어 신뢰성**: NTP, ArduinoJson, clientId, 동적 태그, 이벤트 버퍼, TLS
+4. **Phase D — 백엔드 + DB**: 브로커 하드닝, Postgres+Influx, 인증, staleness
+5. **Phase E — 대시보드 실연동**: `USE_MOCK=false`, staleness UI, STOP/RUN 우선
+6. **Phase F — 측위/GPS**, **Phase G — 강화/법규**
 
 ---
 

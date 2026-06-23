@@ -20,6 +20,13 @@ extern dwt_txconfig_t txconfig_options;
 #define POLL_RX_TO_RESP_TX_DLY_UUS 800
 #define WDT_TIMEOUT_S           10
 
+/* ── RX 타임아웃 (리뷰 C2) ──
+ * 단위 ≈ 1.026us. 0 = 무한 대기(기존 버그: 앵커 부재 시 spin이 안 풀려
+ * WDT가 리셋되지 못하고 10초마다 리부트). 타임아웃을 두면 수신기가 주기적으로
+ * 풀려 loop()가 재진입하고 WDT가 리셋된다 → 앵커 부재를 정상 idle로 처리.
+ * 150000 ≈ 150ms. 풀리면 즉시 재수신하므로 deaf 구간은 무시할 수준. */
+#define RX_TIMEOUT_UUS          150000
+
 /* ── 프레임 필드 인덱스 (Anchor와 동일) ── */
 #define ALL_MSG_SN_IDX          2
 #define MSG_ANCHOR_ID_IDX       5
@@ -74,6 +81,7 @@ void setup()
   dwt_configuretxrf(&txconfig_options);
   dwt_setrxantennadelay(RX_ANT_DLY);
   dwt_settxantennadelay(TX_ANT_DLY);
+  dwt_setrxtimeout(RX_TIMEOUT_UUS);  /* C2: 무한 spin 방지 → 앵커 부재 시 리부트 안 함 */
   dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
 
   Serial.println();
@@ -89,8 +97,10 @@ void loop()
 
   dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
+  /* RXFCG(수신) | RX_TO(타임아웃) | RX_ERR(에러) 중 하나가 뜰 때까지 대기.
+   * 타임아웃이 있으므로 앵커가 없어도 spin이 풀려 다음 loop()에서 WDT가 리셋된다. */
   while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
-           (SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_ERR))) {}
+           (SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR))) {}
 
   if (status_reg & SYS_STATUS_RXFCG_BIT_MASK) {
     dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
@@ -133,6 +143,7 @@ void loop()
       }
     }
   } else {
-    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+    /* 타임아웃 또는 에러 → 상태 클리어, 다음 loop()에서 재수신 (리부트 없음) */
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
   }
 }
