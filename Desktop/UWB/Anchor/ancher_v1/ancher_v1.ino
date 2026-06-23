@@ -50,6 +50,24 @@ static const int     NUM_TAGS  = sizeof(TAG_IDS) / sizeof(TAG_IDS[0]);
 #define DIST_FILTER_SIZE    5   /* 이탈/표시용 윈도우 */
 #define ENTER_FILTER_SIZE   3   /* 진입용 윈도우 (빠른 안전 반응) */
 
+/* ── Phase B: 적응형 폴링 ──
+ * 꺼진 태그(장기 no-range)를 슬로 폴링으로 전환해 활성 태그 사이클 단축.
+ * 하드웨어 확정: 앵커 1대 + 태그 4대. 앵커 간 RF 충돌(C3) 해당 없음.
+ *
+ * SLOW_POLL_THRESHOLD : 비위험 상태에서 연속 no-range N회 → 슬로 전환
+ *                       (10 × 150ms × 4태그 ≈ 6s 응답 없으면 부재로 간주)
+ * SLOW_POLL_PERIOD    : 슬로 중 N사이클마다 1회만 실제 폴링
+ *                       (5사이클 = 재발견 체크 주기 ≈ 활성태그수 × 150ms × 5)
+ *
+ * 효과 예시 (태그 3활성 1꺼짐):
+ *   정상: 4 × 150ms = 600ms 사이클
+ *   슬로: 활성 3태그 ≈ 450ms 사이클, 꺼진 태그 5사이클마다 1회 체크
+ *
+ * SAFETY: 위험 상태(inDanger=true) 태그는 슬로 폴링 전환 안 함.
+ *         꺼진 줄 알았다가 돌아왔을 때 빠르게 감지해야 하기 때문. */
+#define SLOW_POLL_THRESHOLD 10
+#define SLOW_POLL_PERIOD     5
+
 /* ── 프레임 필드 인덱스 ──
  *  [0-1] 프레임 타입  [2] SEQ  [3-4] PAN ID
  *  [5] ANCHOR_ID      [6] TAG_ID  [7] MSG_TYPE
@@ -102,11 +120,13 @@ struct TagState {
   uint8_t id;
   bool    inDanger;
   int     outsideCount;
-  int     noRangeCount;
+  int     noRangeCount;   /* 안전 타임아웃용: inDanger 중 no-range 횟수 */
   double  distBuf[DIST_FILTER_SIZE];
   int     distIdx;
   int     distCount;
   double  lastFiltered;
+  int     absentCount;    /* Phase B: 비위험 중 연속 no-range (슬로 폴링 판단) */
+  uint8_t pollSkip;       /* Phase B: 남은 스킵 사이클 (0=이번 사이클 폴링) */
 };
 
 static TagState tagStates[8];
@@ -120,6 +140,7 @@ struct TagReport {
   float   distRaw;       /* -1 = no range */
   float   distFiltered;
   bool    inDanger;
+  bool    absent;        /* Phase B: 슬로 폴링 중 = 태그 부재로 추정 */
 };
 
 volatile bool      g_relayState         = false;
@@ -189,10 +210,10 @@ static void updateRelay()
   Serial.println(anyDanger ? ">>> RELAY ON" : ">>> RELAY OFF (all safe)");
 }
 
-static void updateReport(int idx, float raw, float filtered, bool danger)
+static void updateReport(int idx, float raw, float filtered, bool danger, bool absent)
 {
   portENTER_CRITICAL(&g_reportMux);
-  g_tagReports[idx]      = {TAG_IDS[idx], raw, filtered, danger};
+  g_tagReports[idx]      = {TAG_IDS[idx], raw, filtered, danger, absent};
   g_reportTimestamp[idx] = (uint32_t)millis();
   portEXIT_CRITICAL(&g_reportMux);
 }
@@ -203,6 +224,8 @@ static void processTagDistance(int idx, double rawDist)
   if (rawDist <= 0.0 || rawDist > 30.0) return;
 
   t.noRangeCount = 0;
+  t.absentCount  = 0;   /* Phase B: 태그 응답 → 부재 카운터 리셋 */
+  t.pollSkip     = 0;   /* Phase B: 슬로 폴링 중이었다면 즉시 정상 복귀 */
   pushSample(t, rawDist);
 
   /* 비대칭 필터 (리뷰 C1):
@@ -233,23 +256,42 @@ static void processTagDistance(int idx, double rawDist)
       t.outsideCount = 0;
     }
   }
-  updateReport(idx, (float)rawDist, (float)t.lastFiltered, t.inDanger);
+  updateReport(idx, (float)rawDist, (float)t.lastFiltered, t.inDanger, false);
 }
 
 static void processNoRange(int idx)
 {
   TagState &t = tagStates[idx];
-  updateReport(idx, -1.0f, -1.0f, t.inDanger);
-  if (!t.inDanger) return;
 
-  t.noRangeCount++;
-  Serial.printf("[Tag#%d] noRangeCount: %d\n", t.id, t.noRangeCount);
-  if (t.noRangeCount >= NO_RANGE_OFF_COUNT) {
-    t.inDanger     = false;
-    t.noRangeCount = 0;
-    t.outsideCount = 0;
-    Serial.printf("[Tag#%d] NO RANGE TIMEOUT -> SAFE\n", t.id);
-    updateRelay();
+  /* ── 위험 상태 중 no-range: 안전 타임아웃만 처리 ──
+   * 위험 중엔 슬로 폴링으로 전환하지 않는다.
+   * 꺼진 줄 알았던 태그가 돌아올 때 최대한 빠르게 감지해야 하기 때문. */
+  if (t.inDanger) {
+    updateReport(idx, -1.0f, -1.0f, true, false);
+    t.noRangeCount++;
+    Serial.printf("[Tag#%d] noRangeCount: %d\n", t.id, t.noRangeCount);
+    if (t.noRangeCount >= NO_RANGE_OFF_COUNT) {
+      t.inDanger     = false;
+      t.noRangeCount = 0;
+      t.outsideCount = 0;
+      Serial.printf("[Tag#%d] NO RANGE TIMEOUT -> SAFE\n", t.id);
+      updateRelay();
+    }
+    return;
+  }
+
+  /* ── 비위험 상태 중 no-range: Phase B 슬로 폴링 판단 ── */
+  t.absentCount++;
+  bool nowAbsent = (t.absentCount >= SLOW_POLL_THRESHOLD);
+  updateReport(idx, -1.0f, -1.0f, false, nowAbsent);
+
+  if (nowAbsent) {
+    /* 슬로 폴링: 다음 SLOW_POLL_PERIOD-1 사이클은 건너뜀 */
+    t.pollSkip = SLOW_POLL_PERIOD - 1;
+    if (t.absentCount == SLOW_POLL_THRESHOLD) {
+      Serial.printf("[Tag#%d] 슬로 폴링 전환 (absent x%d) — 사이클 단축\n",
+                    t.id, t.absentCount);
+    }
   }
 }
 
@@ -283,13 +325,16 @@ static void publishRange(PubSubClient &mqtt)
 
     if (r.distRaw < 0.0f) {
       snprintf(payload, sizeof(payload),
-               "{\"raw\":null,\"filt\":null,\"danger\":%s,\"ts\":%lu}",
-               r.inDanger ? "true" : "false", (unsigned long)localTs[i]);
+               "{\"raw\":null,\"filt\":null,\"danger\":%s,\"absent\":%s,\"ts\":%lu}",
+               r.inDanger ? "true" : "false",
+               r.absent   ? "true" : "false",
+               (unsigned long)localTs[i]);
     } else {
       snprintf(payload, sizeof(payload),
-               "{\"raw\":%.2f,\"filt\":%.2f,\"danger\":%s,\"ts\":%lu}",
+               "{\"raw\":%.2f,\"filt\":%.2f,\"danger\":%s,\"absent\":false,\"ts\":%lu}",
                r.distRaw, r.distFiltered,
-               r.inDanger ? "true" : "false", (unsigned long)localTs[i]);
+               r.inDanger ? "true" : "false",
+               (unsigned long)localTs[i]);
     }
     mqtt.publish(topic, payload, false);
   }
@@ -457,6 +502,16 @@ static void taskUWB(void *pvParameters)
   for (;;) {
     esp_task_wdt_reset();
 
+    /* Phase B: 슬로 폴링 — 장기 부재 태그는 이번 사이클 건너뜀.
+     * delay 없이 즉시 다음 태그로 이동 → 활성 태그 사이클 단축.
+     * SAFETY: 위험 상태 태그는 processNoRange에서 슬로 전환 안 하므로
+     *         여기서 건너뛰어지는 일이 없다. */
+    if (tagStates[currentTagIdx].pollSkip > 0) {
+      tagStates[currentTagIdx].pollSkip--;
+      currentTagIdx = (currentTagIdx + 1) % NUM_TAGS;
+      continue;
+    }
+
     uint8_t targetTagId = TAG_IDS[currentTagIdx];
 
     tx_poll_msg[ALL_MSG_SN_IDX]    = frame_seq_nb;
@@ -528,7 +583,8 @@ void setup()
   relayInit();
 
   for (int i = 0; i < NUM_TAGS; i++) {
-    tagStates[i] = {TAG_IDS[i], false, 0, 0, {0}, 0, 0, 0.0};
+    tagStates[i] = {TAG_IDS[i], false, 0, 0, {0}, 0, 0, 0.0, 0, 0};
+    /*              id  danger  out  noR  buf  idx  cnt  filt  abs  skip */
   }
 
   /* WDT 초기화 — 실제 등록은 각 태스크 내부에서 수행 */
@@ -536,11 +592,12 @@ void setup()
 
   Serial.println();
   Serial.println("=================================");
-  Serial.printf( "UWB ANCHOR #%d  (Phase 2-B)\n", ANCHOR_ID);
+  Serial.printf( "UWB ANCHOR #%d  (Phase B)\n", ANCHOR_ID);
   Serial.printf( "Tags     : %d\n", NUM_TAGS);
   Serial.printf( "Safety   : %.1fm / %.1fm (enter/exit)\n", ENTER_DISTANCE_M, EXIT_DISTANCE_M);
   Serial.printf( "Filter   : median asym (enter=%d, exit=%d)\n", ENTER_FILTER_SIZE, DIST_FILTER_SIZE);
-  Serial.printf( "Cycle    : %dms/tag  total %dms\n", RNG_DELAY_MS, NUM_TAGS * RNG_DELAY_MS);
+  Serial.printf( "Cycle    : %dms/tag  max %dms\n", RNG_DELAY_MS, NUM_TAGS * RNG_DELAY_MS);
+  Serial.printf( "SlowPoll : absent x%d -> 1/%d rate\n", SLOW_POLL_THRESHOLD, SLOW_POLL_PERIOD);
   Serial.printf( "MQTT     : %s:%d\n", MQTT_BROKER, MQTT_PORT);
   Serial.println("=================================");
 
