@@ -1,5 +1,5 @@
 # PROJECT_STATUS.md
-_Last updated: 2026-06-23 (기술 리뷰 반영)_
+_Last updated: 2026-06-24 (하드웨어 동작 확인 및 프레임 구조 수정)_
 
 ---
 
@@ -16,10 +16,10 @@ _Last updated: 2026-06-23 (기술 리뷰 반영)_
 | 항목 | 내용 |
 |---|---|
 | 보드 | Makerfabs ESP32 UWB DW3000 × 5 |
-| 현재 구성 | Anchor 1대 + Tag 4대 |
+| 현재 구성 | Anchor 1대 + Tag 3대 (ID: 2, 3, 4) |
 | 릴레이 핀 | GPIO26 (Anchor 전용) |
 | UWB 핀 | RST=27, IRQ=34, SS=4 |
-| SPI | 16MHz, MSBFIRST, SPI_MODE0 |
+| SPI | **7MHz**, MSBFIRST, SPI_MODE0 (Makerfabs 예제 기준, 16MHz에서 통신 불안정) |
 | 안테나 딜레이 | TX/RX 각 16385 (**미교정 상태 — Phase A 교정 필요**) |
 | ⚠️ 보드 변종 | GPS(GPIO16/17) 연결 전 WROOM/WROVER 확인 필요 (WROVER는 PSRAM 충돌) |
 
@@ -76,18 +76,16 @@ _2026-06-23 시니어 임베디드/풀스택 리뷰 결과. 상세는 ROADMAP.md
 
 | ID | 발견 | 위치 | 영향 | 단계 | 상태 |
 |---|---|---|---|---|---|
-| **C1** | 5-샘플 이동평균 = 약 3초 탐지 지연 | `ancher_v1.ino` | 1.5m/s 접근 시 ~4.5m 좁혀진 뒤 탐지. **정지가 늦음** | A | ✅ 코드 수정 (비대칭 median, 진입 3 / 이탈 5) |
-| **C2** | 태그 RX 타임아웃 없는 무한 스핀 | `tag_v1.ino` | 앵커 부재 시 10초마다 리부트(배터리·가용성 손실) | A | ✅ 코드 수정 (`dwt_setrxtimeout` + re-arm) |
+| **C1** | 5-샘플 이동평균 = 약 3초 탐지 지연 | `ancher_v1.ino` | 1.5m/s 접근 시 ~4.5m 좁혀진 뒤 탐지. **정지가 늦음** | A | ✅ 완료 (비대칭 median, 진입 3 / 이탈 5) |
+| **C2** | 태그 RX 타임아웃 없는 무한 스핀 | `tag_v1.ino` | 앵커 부재 시 10초마다 리부트(배터리·가용성 손실) | A | ✅ 완료 (`dwt_setrxtimeout(60000)` + re-arm) |
 | **C3** | 앵커 간 RF 조율 없음 | 프로토콜 전반 (단일 채널 5) | 앵커 5대 동시 폴링 시 충돌 → 거짓 no-range | B | N/A (앵커 1대 고정 — 5보드 = 1앵커+4태그) |
 | **C4** | 타임스탬프가 `millis()`(가동시간) | 모든 MQTT payload | 앵커 간 상관·리부트 후 추적 불가 → 컴플라이언스 로그 무력 | C | ⬜ 미착수 |
 | **C5** | 안테나 딜레이 미교정 (±10~30cm) | `TX/RX_ANT_DLY 16385` | 3m 임계값에서 절반은 **늦게** 정지 | A | 🟡 2점 교정 SOP 주석화, 실측 교정은 하드웨어 필요 |
 
-> **Phase A 코드 적용 완료 (2026-06-23)** — C1·C2는 펌웨어 반영, C5는 교정 SOP 주석 추가.
-> **Phase B 완료 (2026-06-23)** — C3 해당 없음(1앵커 확정). 적응형 dead-tag 폴링 구현:
-> `absentCount`/`pollSkip`으로 10회 연속 no-range 태그는 1-in-5 슬로 폴링 전환.
-> 위험 상태 태그는 슬로 폴링 예외 적용 — 안전 보장.
-> 모두 **하드웨어 실측 검증 대기** (`arduino-cli` 미설치로 본 환경 컴파일 미수행).
-> 추가: `taskNetwork`는 의도적으로 panic WDT에 등록하지 않음(안전 독립성) — 코드 주석화.
+> **Phase A 완료 (2026-06-24, 하드웨어 동작 확인)** — C1·C2 펌웨어 반영 및 실기기 검증 완료.
+> C5(안테나 교정)는 SOP 주석화, 실측 교정은 별도 진행 필요.
+> **Phase B 완료 (2026-06-23)** — C3 해당 없음(1앵커 확정). 적응형 dead-tag 폴링 구현.
+> **추가 수정 (2026-06-24):** 프레임 구조 전면 개편으로 "no range" 문제 해결 — 아래 참조.
 
 ### 추가 발견 (High/Medium)
 
@@ -124,21 +122,22 @@ UWB/
 
 ---
 
-## 빌드/플래시 환경 (2026-06-23 확인)
+## 빌드/플래시 환경 (2026-06-24 확인)
 
 | 항목 | 상태 |
 |---|---|
 | `arduino-cli` (독립) | ❌ 미설치 |
 | IDE 번들 `arduino-cli` | ✅ `C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe` |
-| esp32 코어 | ✅ 3.3.7 (Latest 3.3.10) |
+| esp32 코어 | ✅ 3.3.7 |
 | Dw3000 라이브러리 | ✅ `Documents\Arduino\libraries\Dw3000` |
-| PubSubClient | ❌ **미설치** — 프로덕션 앵커 컴파일에 필요 (테스트 A는 불필요) |
-| 테스트 A 스케치 컴파일 | ✅ 통과 (FQBN `esp32:esp32:esp32`, flash 22% / RAM 6%) |
+| PubSubClient | ✅ 설치됨 (Nick O'Leary) |
+| 앵커 컴파일 | ✅ 통과 (flash 70% / RAM 14%) |
+| 태그 컴파일 | ✅ 통과 (flash 22% / RAM 6%) |
+| 하드웨어 동작 | ✅ **2026-06-24 ranging 동작 확인** |
 
-**프로덕션 플래시 전 처리 필요 (테스트 A 이후):**
-1. `PubSubClient by Nick O'Leary` 설치 (없으면 앵커 컴파일 실패)
-2. **esp32 코어 3.x WDT 시그니처** — `esp_task_wdt_init(WDT_TIMEOUT_S, true)`의
-   타임아웃 단위가 코어 3.x에서 초→밀리초로 바뀌어 의도와 다르게 동작할 소지. 실측 확인 필요.
+**ESP32 코어 3.x 호환성 (수정 완료):**
+- WDT: `esp_task_wdt_reconfigure(&config)` 방식으로 교체 (Arduino 코어가 TWDT 선점 초기화)
+- `volatile TagReport[]` 제거 → portMUX 크리티컬 섹션으로 보호 (volatile 불필요, C++ 컴파일 에러 해결)
 
 컴파일 예:
 ```powershell
@@ -191,9 +190,12 @@ uwb/anchor/{id}/status              — 헬스체크, 30초 주기, retain=true
 | 항목 | 값 |
 |---|---|
 | 태그 1개당 폴링 간격 | 150ms |
-| 전체 사이클 (태그 4개, 전원 정상) | 600ms |
-| 각 태그 측정 주기 | ~1.67Hz |
-| RX 타임아웃 (Anchor) | 3ms |
+| 전체 사이클 (태그 3개, 전원 정상) | 450ms |
+| 각 태그 측정 주기 | ~2.2Hz |
+| Anchor RX 대기 지연 (poll TX 후) | 500µs |
+| Anchor RX 타임아웃 | 5ms |
+| Tag 응답 지연 (poll RX 후) | 1500µs |
+| Tag RX 타임아웃 (앵커 없을 때) | 60ms |
 | 비대칭 median 진입 지연 | median(3) = 약 **450ms** (C1 수정, 기존 3초→단축) |
 | 비대칭 median 이탈 지연 | median(5)+3회연속 = 약 3초 (의도된 디바운스) |
 | **슬로 폴링 전환 기준 (Phase B)** | 10회 연속 no-range → 1-in-5 (해당 태그 ~3s 주기) |
@@ -217,10 +219,27 @@ uwb/anchor/{id}/status              — 헬스체크, 30초 주기, retain=true
 
 | 보드 | 펌웨어 | 변경 항목 |
 |---|---|---|
-| #1 | Anchor | `ANCHOR_ID 1`, `TAG_IDS[] = {2,3,4,5}` |
+| #1 | Anchor | `ANCHOR_ID 1`, `TAG_IDS[] = {2,3,4}` |
 | #2 | Tag | `MY_TAG_ID 2` |
 | #3 | Tag | `MY_TAG_ID 3` |
 | #4 | Tag | `MY_TAG_ID 4` |
-| #5 | Tag | `MY_TAG_ID 5` |
 
-필수 라이브러리: `PubSubClient by Nick O'Leary` (Arduino Library Manager)
+필수 라이브러리: `PubSubClient by Nick O'Leary` (✅ 설치됨)
+
+---
+
+## 2026-06-24 프레임 구조 수정 — "no range" 근본 원인 해결
+
+기존 코드는 프레임 인덱스가 Makerfabs 예제와 달라 앵커/태그가 서로의 프레임을 인식하지 못했다.
+
+| 항목 | 변경 전 | 변경 후 |
+|---|---|---|
+| Poll 길이 | 10 bytes | **12 bytes** (FCS 2바이트 명시) |
+| Response 길이 | 18 bytes | **20 bytes** (FCS 2바이트 명시) |
+| [7] | MSG_TYPE (0xE0/0xE1) | **FRAME_MARKER0 = 'U'** |
+| [8] | 패딩 | **FRAME_MARKER1 = 'W'** |
+| [9] | 패딩 | **MSG_TYPE (0xE0/0xE1)** |
+| SPI 속도 | 16 MHz | **7 MHz** |
+| `dwt_softreset()` | 없음 | **초기화 전 추가** |
+| status 관리 | 인라인 | **`clearUwbStatus()` / `waitForUwbStatus()` 헬퍼** |
+| 응답 프레임 검증 | type + tagId만 | **header 전체 (0x41,0x88,0xCA,0xDE,markers,type,IDs)** |

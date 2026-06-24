@@ -10,18 +10,17 @@ UWB (Ultra-Wideband) safety distance detection system using Makerfabs ESP32 UWB 
 
 This project uses the Arduino IDE. There is no build script — compile and upload via the IDE or `arduino-cli`.
 
-```bash
-# Using arduino-cli (install separately)
-arduino-cli compile --fqbn esp32:esp32:esp32 Anchor/ancher_v1/ancher_v1.ino
-arduino-cli upload  --fqbn esp32:esp32:esp32 -p <PORT> Anchor/ancher_v1/ancher_v1.ino
-
-arduino-cli compile --fqbn esp32:esp32:esp32 Tag/tag_v1/tag_v1.ino
-arduino-cli upload  --fqbn esp32:esp32:esp32 -p <PORT> Tag/tag_v1/tag_v1.ino
+```powershell
+# Bundled arduino-cli (no standalone install needed)
+$cli = "C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe"
+$lib = "$env:USERPROFILE\Documents\Arduino\libraries"
+& $cli compile --fqbn esp32:esp32:esp32 --libraries $lib Anchor/ancher_v1
+& $cli compile --fqbn esp32:esp32:esp32 --libraries $lib Tag/tag_v1
 ```
 
 Serial monitor baud rate: **115200**
 
-Required libraries: `dw3000` (Makerfabs DW3000 Arduino library), `SPI` (bundled with ESP32 core).
+Required libraries: `dw3000` (Makerfabs DW3000 Arduino library), `SPI` (bundled), `PubSubClient` (Nick O'Leary — Anchor only).
 
 ## Architecture
 
@@ -34,9 +33,9 @@ Required libraries: `dw3000` (Makerfabs DW3000 Arduino library), `SPI` (bundled 
 
 ### Two-Way Ranging (TWR) Protocol
 
-1. **Anchor** polls one tag at a time, round-robin (`RNG_DELAY_MS` = 150 ms per tag; full cycle = 150 ms × N tags = 600 ms for 4 tags).
-2. **Tag** receives the poll, waits 800 µs, then sends a response frame (`VEWA` + `0xE1`) embedding its own RX and TX timestamps.
-3. **Anchor** extracts the four timestamps (poll TX, response RX, poll RX @ tag, response TX @ tag) and computes:
+1. **Anchor** polls one tag at a time, round-robin (`RNG_DELAY_MS` = 150 ms per tag).
+2. **Tag** receives the poll, waits 1500 µs (`POLL_RX_TO_RESP_TX_DLY_UUS`), then sends a response frame embedding its own RX and TX timestamps.
+3. **Anchor** extracts the four timestamps and computes:
    ```
    ToF = ((RTD_init − RTD_resp × (1 − clockOffsetRatio)) / 2) × DWT_TIME_UNITS
    distance = ToF × SPEED_OF_LIGHT
@@ -44,33 +43,83 @@ Required libraries: `dw3000` (Makerfabs DW3000 Arduino library), `SPI` (bundled 
 
 Both devices use identical DW3000 radio config: **channel 5**, preamble 128, PAC8, **6.8 Mbps**, STS off.
 
+### Frame Layout (both devices must match exactly)
+
+```
+poll frame    : 12 bytes
+response frame: 20 bytes
+
+Index  Field
+[0]    0x41  (frame ctrl lo)
+[1]    0x88  (frame ctrl hi)
+[2]    SEQ   (sequence number, zeroed before compare)
+[3]    0xCA  (PAN ID lo)
+[4]    0xDE  (PAN ID hi)
+[5]    ANCHOR_ID
+[6]    TAG_ID
+[7]    'U'   (FRAME_MARKER0 — sync marker)
+[8]    'W'   (FRAME_MARKER1 — sync marker)
+[9]    0xE0  (MSG_TYPE_POLL) or 0xE1 (MSG_TYPE_RESP)
+[10-13] poll_rx_ts   (response only)
+[14-17] resp_tx_ts   (response only)
+[10-11] FCS placeholder (poll only)
+[18-19] FCS placeholder (response only)
+```
+
+> ⚠️ Do NOT change frame indices without updating BOTH sketches simultaneously.
+> The 'U'/'W' sync markers at [7][8] were the key fix that resolved "no range" on hardware.
+
+### DW3000 Initialization Sequence
+
+Both devices call this before any TX/RX:
+```cpp
+dwt_softreset();          // required for reliable re-init
+delay(2);
+dwt_checkidlerc();        // wait for IDLE
+dwt_initialise(DWT_DW_INIT);
+dwt_configure(&config);
+dwt_configuretxrf(&txconfig_options);
+dwt_setrxantennadelay(RX_ANT_DLY);
+dwt_settxantennadelay(TX_ANT_DLY);
+clearUwbStatus();         // clear all status bits before first RX/TX
+```
+
+SPI speed: **7 MHz** (not 16 MHz — 7 MHz matches Makerfabs examples and is more stable).
+
 ### Relay Safety Logic (Anchor only)
 
 | Condition | Action |
 |---|---|
-| distance ≤ 3.00 m | Relay ON immediately |
-| distance ≥ 3.20 m × 3 consecutive readings | Relay OFF |
+| enterDist (median-3) ≤ 3.00 m | Relay ON immediately |
+| exitDist (median-5) ≥ 3.20 m × 3 consecutive readings | Relay OFF |
 | No valid range × 20 consecutive polls | Relay OFF (fail-safe) |
 
-`outsideCount` must **not** be reset on a no-range tick — doing so would prevent the relay from ever turning off while range is intermittent (see comment in `noRangeTick()`).
+Asymmetric filter (C1 fix): enter uses median(3) for fast response, exit uses median(5) for debounce.
 
-> ⚠️ The ENTER decision currently uses the 5-sample moving average, which adds ~3 s of latency (review finding C1). The intended fix (Phase A) is asymmetric filtering: enter on raw/median(3), exit on median(5). See ROADMAP.md.
+`outsideCount` must **not** be reset on a no-range tick.
+
+### Relay Safety Logic — Phase B (adaptive polling)
+
+Tags with 10 consecutive no-range (absent) are moved to 1-in-5 slow polling to shorten the active-tag cycle. Tags that are `inDanger` are **never** slow-polled (safety invariant).
 
 ## Known Issues & Current Priorities
 
-A 2026-06-23 architecture review re-sequenced the roadmap so that **safety correctness comes before monitoring features** (GPS/backend). Before changing firmware, read `PROJECT_STATUS.md` (critical findings table) and `ROADMAP.md` (Phase A–G). `CLAUDE_CONTEXT.md` holds the non-negotiable principles.
+Critical findings from 2026-06-23 architecture review:
 
-Critical, fix-first items:
+| ID | Issue | Status |
+|---|---|---|
+| C1 | 5-sample moving average ≈ 3 s detection lag | ✅ Fixed — asymmetric median(3)/median(5) |
+| C2 | Tag RX timeout missing → reboots every 10 s when anchor absent | ✅ Fixed — `dwt_setrxtimeout(60000)` + re-arm |
+| C3 | No anchor-to-anchor RF coordination | N/A — 1 anchor hardware confirmed |
+| C4 | Timestamps are `millis()` (uptime), not epoch | ⬜ Phase C |
+| C5 | Uncalibrated antenna delay (±10–30 cm) | 🟡 SOP documented in code comments, physical cal needed |
 
-| ID | Issue | Where | Phase |
-|---|---|---|---|
-| C1 | 5-sample moving average ≈ 3 s detection lag (machine stops late) | `ancher_v1.ino` `applyFilter` | A |
-| C2 | Tag busy-waits with no RX timeout → reboots every 10 s when anchor absent | `tag_v1.ino` loop (no `dwt_setrxtimeout`) | A |
-| C3 | No anchor-to-anchor RF coordination → collisions with 5 anchors | protocol (single channel 5) | B |
-| C4 | Timestamps are `millis()` (uptime), not epoch | all MQTT payloads | C |
-| C5 | Uncalibrated antenna delay (±10–30 cm) on a 3.00 m threshold | `TX/RX_ANT_DLY` | A |
+Authority chain (do not violate): **anchor decides & timestamps → broker → backend persists → dashboard displays.**
 
-Authority chain (do not violate): **anchor decides & timestamps → broker → backend persists → dashboard displays.** The dashboard must never re-derive danger events from distance.
+## ESP32 Core 3.x Compatibility Notes
+
+- **WDT API**: `esp_task_wdt_init(timeout, panic)` is gone. Use `esp_task_wdt_config_t` + `esp_task_wdt_reconfigure()`. Arduino core 3.x pre-initializes TWDT so call `reconfigure` first, fall back to `init` only if `ESP_ERR_INVALID_STATE`.
+- **`volatile` structs**: C++ default copy-assign does not accept `volatile` struct. Shared data is protected by `portMUX` critical sections (which provide the necessary memory barrier), so `volatile` is not needed on `TagReport[]` / `g_reportTimestamp[]`.
 
 ### Pin Assignment (both boards)
 
@@ -81,4 +130,4 @@ Authority chain (do not violate): **anchor decides & timestamps → broker → b
 | GPIO 34 | DW3000 IRQ |
 | GPIO 26 | Relay output (Anchor only) |
 
-SPI clock: 16 MHz, MSBFIRST, SPI_MODE0. Antenna delays are both set to **16385** (tune per physical calibration if distance accuracy drifts).
+SPI: 7 MHz, MSBFIRST, SPI_MODE0. Antenna delays both set to **16385** (tune per physical calibration).

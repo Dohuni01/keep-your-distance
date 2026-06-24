@@ -1,8 +1,10 @@
 #include "dw3000.h"
 #include "SPI.h"
 #include "esp_task_wdt.h"
+#include "esp_err.h"
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <string.h>
 
 extern SPISettings _fastSPI;
 extern dwt_txconfig_t txconfig_options;
@@ -17,8 +19,10 @@ extern dwt_txconfig_t txconfig_options;
 /* ── 디바이스 설정 (앵커마다 ANCHOR_ID 변경) ── */
 #define ANCHOR_ID 1
 
-/* ── 등록된 태그 ID 목록 ── */
-static const uint8_t TAG_IDS[] = {1, 2, 3, 4};
+/* ── 등록된 태그 ID 목록 ──
+ * 실제 켜져 있는 태그만 넣으세요. 지금 Tag 코드가 MY_TAG_ID 2 하나라면 {2}만 권장.
+ * {2, 3}으로 두고 Tag#3 보드가 꺼져 있으면 Tag#3은 정상적으로 no range가 납니다. */
+static const uint8_t TAG_IDS[] = {2,3,4};
 static const int     NUM_TAGS  = sizeof(TAG_IDS) / sizeof(TAG_IDS[0]);
 
 /* ── 안전 거리 파라미터 ── */
@@ -28,57 +32,46 @@ static const int     NUM_TAGS  = sizeof(TAG_IDS) / sizeof(TAG_IDS[0]);
 #define NO_RANGE_OFF_COUNT 20
 #define RNG_DELAY_MS       150
 
-/* ── DW3000 타이밍 ── */
-/* ⚠️ 안테나 딜레이 교정 (리뷰 C5) — 미교정 시 ±10~30cm 오차, 3m 임계값에서 늦은 정지 위험.
- *    2점 교정 SOP:
- *      1) 태그를 정확히 알려진 거리(예: 2.00m, 5.00m)에 고정
- *      2) 시리얼 raw 거리 평균을 읽어 오차(측정-실제) 계산
- *      3) 오차 1cm ≈ ANT_DLY 약 0.5 LSB. 측정이 멀게 나오면 ANT_DLY를 키움
- *      4) TX_ANT_DLY = RX_ANT_DLY 동일 적용, 두 거리에서 모두 ±5cm 들도록 반복
- *    교정값은 보드(안테나)마다 다르므로 디바이스별로 따로 둘 것. */
-#define TX_ANT_DLY              16385
-#define RX_ANT_DLY              16385
-#define POLL_TX_TO_RESP_RX_DLY_UUS 240
-#define RESP_RX_TIMEOUT_UUS        3000
+/* ── DW3000 타이밍 ──
+ * Makerfabs 기본 예제는 SPI 7MHz, softreset, 12-byte poll / 20-byte response를 사용한다.
+ * 아래 값은 응답 지연을 넉넉하게 잡은 디버그 안정화용 설정. */
+#define SPI_HZ                     7000000L
+#define TX_ANT_DLY                 16385
+#define RX_ANT_DLY                 16385
+#define POLL_TX_TO_RESP_RX_DLY_UUS 500
+#define RESP_RX_TIMEOUT_UUS        5000
 
-/* ── 워치독 / 필터 ──
- * 비대칭 median 필터 (리뷰 C1):
- *   진입(릴레이 ON) = 최근 ENTER_FILTER_SIZE개 median → 빠른 반응
- *   이탈(릴레이 OFF) = 최근 DIST_FILTER_SIZE개 median → 신중 (멀티패스 스파이크 내성)
- * median은 평균과 달리 단발 스파이크에 끌려가지 않는다. */
+/* ── 워치독 / 필터 ── */
 #define WDT_TIMEOUT_S      15
-#define DIST_FILTER_SIZE    5   /* 이탈/표시용 윈도우 */
-#define ENTER_FILTER_SIZE   3   /* 진입용 윈도우 (빠른 안전 반응) */
+#define DIST_FILTER_SIZE    5
+#define ENTER_FILTER_SIZE   3
 
-/* ── Phase B: 적응형 폴링 ──
- * 꺼진 태그(장기 no-range)를 슬로 폴링으로 전환해 활성 태그 사이클 단축.
- * 하드웨어 확정: 앵커 1대 + 태그 4대. 앵커 간 RF 충돌(C3) 해당 없음.
- *
- * SLOW_POLL_THRESHOLD : 비위험 상태에서 연속 no-range N회 → 슬로 전환
- *                       (10 × 150ms × 4태그 ≈ 6s 응답 없으면 부재로 간주)
- * SLOW_POLL_PERIOD    : 슬로 중 N사이클마다 1회만 실제 폴링
- *                       (5사이클 = 재발견 체크 주기 ≈ 활성태그수 × 150ms × 5)
- *
- * 효과 예시 (태그 3활성 1꺼짐):
- *   정상: 4 × 150ms = 600ms 사이클
- *   슬로: 활성 3태그 ≈ 450ms 사이클, 꺼진 태그 5사이클마다 1회 체크
- *
- * SAFETY: 위험 상태(inDanger=true) 태그는 슬로 폴링 전환 안 함.
- *         꺼진 줄 알았다가 돌아왔을 때 빠르게 감지해야 하기 때문. */
+/* ── Phase B: 적응형 폴링 ── */
 #define SLOW_POLL_THRESHOLD 10
 #define SLOW_POLL_PERIOD     5
 
 /* ── 프레임 필드 인덱스 ──
- *  [0-1] 프레임 타입  [2] SEQ  [3-4] PAN ID
- *  [5] ANCHOR_ID      [6] TAG_ID  [7] MSG_TYPE
- *  [8-9] 패딩         [10-13] poll_rx_ts  [14-17] resp_tx_ts
+ * DW3000/Makerfabs 예제 구조를 유지한다.
+ * TX 길이는 2-byte FCS 포함 길이로 잡는 형태가 예제와 맞다.
+ *  poll    : 12 bytes = [0..9 common] + [10..11 FCS 자리]
+ *  response: 20 bytes = [0..9 common] + [10..17 timestamps] + [18..19 FCS 자리]
  */
 #define ALL_MSG_SN_IDX          2
 #define MSG_ANCHOR_ID_IDX       5
 #define MSG_TAG_ID_IDX          6
-#define MSG_TYPE_IDX            7
+#define MSG_MARKER0_IDX         7
+#define MSG_MARKER1_IDX         8
+#define MSG_TYPE_IDX            9
 #define RESP_MSG_POLL_RX_TS_IDX 10
 #define RESP_MSG_RESP_TX_TS_IDX 14
+#define RESP_MSG_TS_LEN         4
+#define POLL_MSG_LEN            12
+#define RESP_MSG_LEN            20
+#define RESP_MSG_MIN_READ_LEN   (RESP_MSG_RESP_TX_TS_IDX + RESP_MSG_TS_LEN)  /* 18 */
+#define FRAME_MARKER0           'U'
+#define FRAME_MARKER1           'W'
+#define MSG_TYPE_POLL           0xE0
+#define MSG_TYPE_RESP           0xE1
 
 /* ═══════════════════════════════════════
  *  Phase 2-B: WiFi / MQTT 설정
@@ -88,10 +81,9 @@ static const int     NUM_TAGS  = sizeof(TAG_IDS) / sizeof(TAG_IDS[0]);
 #define WIFI_PASSWORD  "your_password"
 #define MQTT_BROKER    "192.168.1.100"   /* 브로커 IP 또는 도메인 */
 #define MQTT_PORT      1883
-#define MQTT_USER      ""                /* 인증 없으면 빈 문자열 */
+#define MQTT_USER      ""
 #define MQTT_PASS      ""
 
-/* publish 주기 */
 #define RANGE_PUB_MS   1000
 #define STATUS_PUB_MS  30000
 #define MQTT_RETRY_MS  5000
@@ -103,56 +95,92 @@ static dwt_config_t config = {
   (129 + 8 - 8), DWT_STS_MODE_OFF, DWT_STS_LEN_64, DWT_PDOA_M0
 };
 
-static uint8_t tx_poll_msg[] = {
+static uint8_t tx_poll_msg[POLL_MSG_LEN] = {
   0x41, 0x88, 0, 0xCA, 0xDE,
-  0, 0, 0xE0, 0, 0
+  0,              /* [5] ANCHOR_ID */
+  0,              /* [6] TAG_ID */
+  FRAME_MARKER0,  /* [7] marker */
+  FRAME_MARKER1,  /* [8] marker */
+  MSG_TYPE_POLL,  /* [9] poll type */
+  0, 0            /* [10-11] FCS 자리 */
 };
 
 static uint8_t frame_seq_nb = 0;
-static uint8_t rx_buffer[20];
+static uint8_t rx_buffer[32];
 static uint32_t status_reg = 0;
 
 bool relayState    = false;
 int  currentTagIdx = 0;
 
-/* ── 태그별 상태 ── */
 struct TagState {
   uint8_t id;
   bool    inDanger;
   int     outsideCount;
-  int     noRangeCount;   /* 안전 타임아웃용: inDanger 중 no-range 횟수 */
+  int     noRangeCount;
   double  distBuf[DIST_FILTER_SIZE];
   int     distIdx;
   int     distCount;
   double  lastFiltered;
-  int     absentCount;    /* Phase B: 비위험 중 연속 no-range (슬로 폴링 판단) */
-  uint8_t pollSkip;       /* Phase B: 남은 스킵 사이클 (0=이번 사이클 폴링) */
+  int     absentCount;
+  uint8_t pollSkip;
 };
 
 static TagState tagStates[8];
 
-/* ────────────────────────────────────────────────────────
- *  Core 간 공유 데이터
- *  Core 1(UWB) 쓰기 전용 / Core 0(Network) 읽기 전용
- * ──────────────────────────────────────────────────────── */
 struct TagReport {
   uint8_t tagId;
   float   distRaw;       /* -1 = no range */
   float   distFiltered;
   bool    inDanger;
-  bool    absent;        /* Phase B: 슬로 폴링 중 = 태그 부재로 추정 */
+  bool    absent;
 };
 
 volatile bool      g_relayState         = false;
-volatile TagReport g_tagReports[8]      = {};
-volatile uint32_t  g_reportTimestamp[8] = {};
+TagReport          g_tagReports[8]      = {};
+uint32_t           g_reportTimestamp[8] = {};
 portMUX_TYPE       g_reportMux          = portMUX_INITIALIZER_UNLOCKED;
 
-/* ════════════════════════════════════════════════════════
- *  UWB 안전 함수 (Core 1 전용)
- * ════════════════════════════════════════════════════════ */
+static void processNoRange(int idx);
 
-/* 링 버퍼에 raw 1개 push */
+static void clearUwbStatus()
+{
+  dwt_write32bitreg(SYS_STATUS_ID,
+                    SYS_STATUS_TXFRS_BIT_MASK |
+                    SYS_STATUS_RXFCG_BIT_MASK |
+                    SYS_STATUS_ALL_RX_TO |
+                    SYS_STATUS_ALL_RX_ERR);
+}
+
+static bool waitForUwbStatus(uint32_t mask, uint32_t timeoutMs, uint32_t *outStatus)
+{
+  uint32_t start = millis();
+  uint32_t st;
+  do {
+    st = dwt_read32bitreg(SYS_STATUS_ID);
+    if (st & mask) {
+      *outStatus = st;
+      return true;
+    }
+    esp_task_wdt_reset();
+  } while ((millis() - start) <= timeoutMs);
+
+  *outStatus = 0;
+  return false;
+}
+
+static void configureTaskWdt()
+{
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms     = WDT_TIMEOUT_S * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic  = true,
+  };
+  esp_err_t err = esp_task_wdt_reconfigure(&wdt_config);
+  if (err == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_init(&wdt_config);
+  }
+}
+
 static void pushSample(TagState &t, double raw)
 {
   t.distBuf[t.distIdx] = raw;
@@ -160,8 +188,6 @@ static void pushSample(TagState &t, double raw)
   if (t.distCount < DIST_FILTER_SIZE) t.distCount++;
 }
 
-/* 최근 n개 샘플의 median. n은 보유 샘플 수로 클램프.
- * (멀티패스 스파이크 내성: 평균과 달리 단발 이상치에 끌려가지 않음) */
 static double medianOfLast(TagState &t, int n)
 {
   if (n > t.distCount) n = t.distCount;
@@ -172,7 +198,7 @@ static double medianOfLast(TagState &t, int n)
     int idx = (t.distIdx - 1 - k + DIST_FILTER_SIZE * 2) % DIST_FILTER_SIZE;
     tmp[k]  = t.distBuf[idx];
   }
-  /* 삽입 정렬 (n ≤ 5) */
+
   for (int i = 1; i < n; i++) {
     double key = tmp[i];
     int j = i - 1;
@@ -182,8 +208,8 @@ static double medianOfLast(TagState &t, int n)
   return tmp[n / 2];
 }
 
-static int  relayOnLevel()  { return RELAY_ACTIVE_LOW ? LOW  : HIGH; }
-static int  relayOffLevel() { return RELAY_ACTIVE_LOW ? HIGH : LOW;  }
+static int relayOnLevel()  { return RELAY_ACTIVE_LOW ? LOW  : HIGH; }
+static int relayOffLevel() { return RELAY_ACTIVE_LOW ? HIGH : LOW;  }
 
 static void setRelay(bool on)
 {
@@ -194,8 +220,8 @@ static void setRelay(bool on)
 
 static void relayInit()
 {
-  digitalWrite(RELAY_PIN, relayOffLevel());
   pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, relayOffLevel());
   setRelay(false);
 }
 
@@ -221,16 +247,18 @@ static void updateReport(int idx, float raw, float filtered, bool danger, bool a
 static void processTagDistance(int idx, double rawDist)
 {
   TagState &t = tagStates[idx];
-  if (rawDist <= 0.0 || rawDist > 30.0) return;
+
+  if (rawDist <= 0.0 || rawDist > 30.0) {
+    Serial.printf("[Tag#%d] invalid distance %.2fm -> treated as no range\n", t.id, rawDist);
+    processNoRange(idx);
+    return;
+  }
 
   t.noRangeCount = 0;
-  t.absentCount  = 0;   /* Phase B: 태그 응답 → 부재 카운터 리셋 */
-  t.pollSkip     = 0;   /* Phase B: 슬로 폴링 중이었다면 즉시 정상 복귀 */
+  t.absentCount  = 0;
+  t.pollSkip     = 0;
   pushSample(t, rawDist);
 
-  /* 비대칭 필터 (리뷰 C1):
-   *   enterDist = 짧은 윈도우 median → 위험 진입을 빠르게 감지 (안전은 빠르게)
-   *   exitDist  = 긴 윈도우 median  → 이탈/표시는 신중하게 (복구는 신중하게) */
   double enterDist = medianOfLast(t, ENTER_FILTER_SIZE);
   double exitDist  = medianOfLast(t, DIST_FILTER_SIZE);
   t.lastFiltered   = exitDist;
@@ -256,6 +284,7 @@ static void processTagDistance(int idx, double rawDist)
       t.outsideCount = 0;
     }
   }
+
   updateReport(idx, (float)rawDist, (float)t.lastFiltered, t.inDanger, false);
 }
 
@@ -263,9 +292,6 @@ static void processNoRange(int idx)
 {
   TagState &t = tagStates[idx];
 
-  /* ── 위험 상태 중 no-range: 안전 타임아웃만 처리 ──
-   * 위험 중엔 슬로 폴링으로 전환하지 않는다.
-   * 꺼진 줄 알았던 태그가 돌아올 때 최대한 빠르게 감지해야 하기 때문. */
   if (t.inDanger) {
     updateReport(idx, -1.0f, -1.0f, true, false);
     t.noRangeCount++;
@@ -280,13 +306,11 @@ static void processNoRange(int idx)
     return;
   }
 
-  /* ── 비위험 상태 중 no-range: Phase B 슬로 폴링 판단 ── */
   t.absentCount++;
   bool nowAbsent = (t.absentCount >= SLOW_POLL_THRESHOLD);
   updateReport(idx, -1.0f, -1.0f, false, nowAbsent);
 
   if (nowAbsent) {
-    /* 슬로 폴링: 다음 SLOW_POLL_PERIOD-1 사이클은 건너뜀 */
     t.pollSkip = SLOW_POLL_PERIOD - 1;
     if (t.absentCount == SLOW_POLL_THRESHOLD) {
       Serial.printf("[Tag#%d] 슬로 폴링 전환 (absent x%d) — 사이클 단축\n",
@@ -297,22 +321,16 @@ static void processNoRange(int idx)
 
 /* ════════════════════════════════════════════════════════
  *  MQTT publish 헬퍼 (Core 0 전용)
- *
- *  MQTT 토픽 구조:
- *    uwb/anchor/{id}/tag/{tag_id}/range  — 거리 데이터 (1초 주기)
- *    uwb/anchor/{id}/relay               — 릴레이 상태 변경 즉시, retain
- *    uwb/anchor/{id}/status              — 헬스체크 30초 주기, retain
  * ════════════════════════════════════════════════════════ */
 
 static void publishRange(PubSubClient &mqtt)
 {
-  /* 크리티컬 섹션에서 빠르게 로컬 복사 후 섹션 밖에서 publish */
   TagReport localReports[8];
   uint32_t  localTs[8];
 
   portENTER_CRITICAL(&g_reportMux);
   for (int i = 0; i < NUM_TAGS; i++) {
-    localReports[i] = (TagReport)g_tagReports[i];
+    localReports[i] = g_tagReports[i];
     localTs[i]      = g_reportTimestamp[i];
   }
   portEXIT_CRITICAL(&g_reportMux);
@@ -347,7 +365,7 @@ static void publishRelay(PubSubClient &mqtt, bool state)
   snprintf(payload, sizeof(payload),
            "{\"state\":%s,\"ts\":%lu}",
            state ? "true" : "false", (unsigned long)millis());
-  mqtt.publish(topic, payload, true); /* retain — 대시보드 접속 시 마지막 상태 즉시 수신 */
+  mqtt.publish(topic, payload, true);
 }
 
 static void publishStatus(PubSubClient &mqtt, bool online)
@@ -360,22 +378,14 @@ static void publishStatus(PubSubClient &mqtt, bool online)
            ANCHOR_ID, NUM_TAGS,
            (unsigned long)(millis() / 1000),
            (unsigned long)millis());
-  mqtt.publish(topic, payload, true); /* retain */
+  mqtt.publish(topic, payload, true);
 }
 
-/* ════════════════════════════════════════════════════════
- *  Core 0 태스크 — 네트워크 리포팅
- *
- *  SAFETY: 이 태스크가 죽거나 WiFi/MQTT가 끊겨도
- *          Core 1의 UWB 안전 루프와 GPIO26 릴레이는
- *          완전히 독립적으로 동작한다.
- * ════════════════════════════════════════════════════════ */
 static void taskNetwork(void *pvParameters)
 {
   static WiFiClient   wifiClient;
   static PubSubClient mqtt(wifiClient);
 
-  /* LWT: 앵커가 비정상 종료되면 브로커가 offline 메시지를 자동 발행 */
   char lwt_topic[48];
   snprintf(lwt_topic, sizeof(lwt_topic), "uwb/anchor/%d/status", ANCHOR_ID);
   const char *lwt_payload = "{\"online\":false}";
@@ -384,7 +394,6 @@ static void taskNetwork(void *pvParameters)
   mqtt.setKeepAlive(15);
   mqtt.setSocketTimeout(5);
 
-  /* ── WiFi 초기 연결 (최대 15초 대기) ── */
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -406,22 +415,20 @@ static void taskNetwork(void *pvParameters)
   bool     lastRelay     = false;
 
   for (;;) {
-    /* ── WiFi 체크 ── */
     if (WiFi.status() != WL_CONNECTED) {
-      /* setAutoReconnect(true)가 처리하므로 로그만 출력 */
       Serial.println("[Net] WiFi 끊김 — 재연결 대기중");
       vTaskDelay(pdMS_TO_TICKS(3000));
       continue;
     }
 
-    /* ── MQTT 재연결 ── */
     if (!mqtt.connected()) {
       uint32_t now = millis();
       if (now - lastMqttRetry >= MQTT_RETRY_MS) {
         lastMqttRetry = now;
 
-        char clientId[32];
-        snprintf(clientId, sizeof(clientId), "anchor-%d", ANCHOR_ID);
+        uint64_t mac = ESP.getEfuseMac();
+        char clientId[40];
+        snprintf(clientId, sizeof(clientId), "anchor-%d-%04X", ANCHOR_ID, (uint16_t)(mac & 0xFFFF));
 
         bool ok = (strlen(MQTT_USER) > 0)
           ? mqtt.connect(clientId, MQTT_USER, MQTT_PASS, lwt_topic, 1, true, lwt_payload)
@@ -429,7 +436,9 @@ static void taskNetwork(void *pvParameters)
 
         if (ok) {
           Serial.printf("[Net] MQTT 연결됨: %s:%d\n", MQTT_BROKER, MQTT_PORT);
-          publishStatus(mqtt, true); /* 온라인 알림 즉시 발행 */
+          publishStatus(mqtt, true);
+          publishRelay(mqtt, g_relayState);
+          lastRelay     = g_relayState;
           lastStatusPub = millis();
         } else {
           Serial.printf("[Net] MQTT 연결 실패 (rc=%d) — %dms 후 재시도\n",
@@ -440,11 +449,9 @@ static void taskNetwork(void *pvParameters)
       continue;
     }
 
-    mqtt.loop(); /* 브로커 keep-alive 처리 */
+    mqtt.loop();
 
     uint32_t now = millis();
-
-    /* 릴레이 상태 변경 → 즉시 publish */
     bool curRelay = g_relayState;
     if (curRelay != lastRelay) {
       publishRelay(mqtt, curRelay);
@@ -452,13 +459,11 @@ static void taskNetwork(void *pvParameters)
       Serial.printf("[Net] relay publish: %s\n", curRelay ? "ON" : "OFF");
     }
 
-    /* 1초마다 거리 데이터 publish */
     if (now - lastRangePub >= RANGE_PUB_MS) {
       publishRange(mqtt);
       lastRangePub = now;
     }
 
-    /* 30초마다 헬스체크 publish */
     if (now - lastStatusPub >= STATUS_PUB_MS) {
       publishStatus(mqtt, true);
       lastStatusPub = now;
@@ -468,27 +473,23 @@ static void taskNetwork(void *pvParameters)
   }
 }
 
-/* ════════════════════════════════════════════════════════
- *  Core 1 태스크 — UWB 안전 루프
- *
- *  SAFETY: WiFi / MQTT / 서버 상태와 완전히 독립.
- *          네트워크가 없어도 UWB 측정과 GPIO26 릴레이
- *          제어는 중단 없이 동작한다.
- * ════════════════════════════════════════════════════════ */
 static void taskUWB(void *pvParameters)
 {
-  esp_task_wdt_add(NULL); /* 이 태스크를 WDT 감시 대상으로 등록 */
+  esp_task_wdt_add(NULL);
 
-  _fastSPI = SPISettings(16000000L, MSBFIRST, SPI_MODE0);
+  _fastSPI = SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0);
   spiBegin(PIN_IRQ, PIN_RST);
   spiSelect(PIN_SS);
   delay(2);
 
+  dwt_softreset();
+  delay(2);
+
   while (!dwt_checkidlerc()) { Serial.println("IDLE FAILED"); delay(100); }
-  if (dwt_initialise(DWT_DW_INIT) == DWT_ERROR) { Serial.println("INIT FAILED"); while (1); }
+  if (dwt_initialise(DWT_DW_INIT) == DWT_ERROR) { Serial.println("INIT FAILED"); while (1) { delay(1000); } }
 
   dwt_setleds(DWT_LEDS_ENABLE | DWT_LEDS_INIT_BLINK);
-  if (dwt_configure(&config)) { Serial.println("CONFIG FAILED"); while (1); }
+  if (dwt_configure(&config)) { Serial.println("CONFIG FAILED"); while (1) { delay(1000); } }
 
   dwt_configuretxrf(&txconfig_options);
   dwt_setrxantennadelay(RX_ANT_DLY);
@@ -497,15 +498,15 @@ static void taskUWB(void *pvParameters)
   dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
   dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
 
+  clearUwbStatus();
+
   Serial.println("[UWB] task started on Core 1");
+  Serial.printf("[UWB] SPI=%ldHz, rxAfterTx=%dus, rxTimeout=%dus\n",
+                (long)SPI_HZ, POLL_TX_TO_RESP_RX_DLY_UUS, RESP_RX_TIMEOUT_UUS);
 
   for (;;) {
     esp_task_wdt_reset();
 
-    /* Phase B: 슬로 폴링 — 장기 부재 태그는 이번 사이클 건너뜀.
-     * delay 없이 즉시 다음 태그로 이동 → 활성 태그 사이클 단축.
-     * SAFETY: 위험 상태 태그는 processNoRange에서 슬로 전환 안 하므로
-     *         여기서 건너뛰어지는 일이 없다. */
     if (tagStates[currentTagIdx].pollSkip > 0) {
       tagStates[currentTagIdx].pollSkip--;
       currentTagIdx = (currentTagIdx + 1) % NUM_TAGS;
@@ -517,28 +518,53 @@ static void taskUWB(void *pvParameters)
     tx_poll_msg[ALL_MSG_SN_IDX]    = frame_seq_nb;
     tx_poll_msg[MSG_ANCHOR_ID_IDX] = ANCHOR_ID;
     tx_poll_msg[MSG_TAG_ID_IDX]    = targetTagId;
+    tx_poll_msg[MSG_MARKER0_IDX]   = FRAME_MARKER0;
+    tx_poll_msg[MSG_MARKER1_IDX]   = FRAME_MARKER1;
+    tx_poll_msg[MSG_TYPE_IDX]      = MSG_TYPE_POLL;
 
-    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+    clearUwbStatus();
     dwt_writetxdata(sizeof(tx_poll_msg), tx_poll_msg, 0);
     dwt_writetxfctrl(sizeof(tx_poll_msg), 0, 1);
-    dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
 
-    while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
-             (SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR))) {}
+    int txRet = dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
+    if (txRet != DWT_SUCCESS) {
+      Serial.printf("[Tag#%d] poll TX failed -> no range\n", targetTagId);
+      clearUwbStatus();
+      processNoRange(currentTagIdx);
+      currentTagIdx = (currentTagIdx + 1) % NUM_TAGS;
+      vTaskDelay(pdMS_TO_TICKS(RNG_DELAY_MS));
+      continue;
+    }
+
+    waitForUwbStatus(SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR,
+                     50, &status_reg);
 
     frame_seq_nb++;
+
+    bool gotValidResponse = false;
 
     if (status_reg & SYS_STATUS_RXFCG_BIT_MASK) {
       dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
       uint32_t frame_len = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
 
-      if (frame_len <= sizeof(rx_buffer)) {
+      if (frame_len <= sizeof(rx_buffer) && frame_len >= RESP_MSG_MIN_READ_LEN) {
+        memset(rx_buffer, 0, sizeof(rx_buffer));
         dwt_readrxdata(rx_buffer, frame_len, 0);
         rx_buffer[ALL_MSG_SN_IDX] = 0;
 
-        if (rx_buffer[MSG_ANCHOR_ID_IDX] == ANCHOR_ID  &&
-            rx_buffer[MSG_TAG_ID_IDX]    == targetTagId &&
-            rx_buffer[MSG_TYPE_IDX]      == 0xE1) {
+        bool headerOk =
+          rx_buffer[0]                 == 0x41 &&
+          rx_buffer[1]                 == 0x88 &&
+          rx_buffer[3]                 == 0xCA &&
+          rx_buffer[4]                 == 0xDE &&
+          rx_buffer[MSG_ANCHOR_ID_IDX] == ANCHOR_ID &&
+          rx_buffer[MSG_TAG_ID_IDX]    == targetTagId &&
+          rx_buffer[MSG_MARKER0_IDX]   == FRAME_MARKER0 &&
+          rx_buffer[MSG_MARKER1_IDX]   == FRAME_MARKER1 &&
+          rx_buffer[MSG_TYPE_IDX]      == MSG_TYPE_RESP;
+
+        if (headerOk) {
+          gotValidResponse = true;
 
           uint32_t poll_tx_ts = dwt_readtxtimestamplo32();
           uint32_t resp_rx_ts = dwt_readrxtimestamplo32();
@@ -560,20 +586,28 @@ static void taskUWB(void *pvParameters)
                         tagStates[currentTagIdx].lastFiltered,
                         tagStates[currentTagIdx].inDanger ? "Y" : "N",
                         relayState ? "ON" : "OFF");
+        } else {
+          Serial.printf("[Tag#%d] bad response frame len=%lu aid=%u tid=%u type=0x%02X\n",
+                        targetTagId, (unsigned long)frame_len,
+                        rx_buffer[MSG_ANCHOR_ID_IDX], rx_buffer[MSG_TAG_ID_IDX], rx_buffer[MSG_TYPE_IDX]);
         }
+      } else {
+        Serial.printf("[Tag#%d] bad response length=%lu\n", targetTagId, (unsigned long)frame_len);
       }
     } else {
-      dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+      Serial.printf("[Tag#%d] no range status=0x%08lX relay:%s\n",
+                    targetTagId, (unsigned long)status_reg, relayState ? "ON" : "OFF");
+    }
+
+    if (!gotValidResponse) {
+      clearUwbStatus();
       processNoRange(currentTagIdx);
-      Serial.printf("[Tag#%d] no range  relay:%s\n", targetTagId, relayState ? "ON" : "OFF");
     }
 
     currentTagIdx = (currentTagIdx + 1) % NUM_TAGS;
     vTaskDelay(pdMS_TO_TICKS(RNG_DELAY_MS));
   }
 }
-
-/* ────────────────────────────────── */
 
 void setup()
 {
@@ -584,47 +618,39 @@ void setup()
 
   for (int i = 0; i < NUM_TAGS; i++) {
     tagStates[i] = {TAG_IDS[i], false, 0, 0, {0}, 0, 0, 0.0, 0, 0};
-    /*              id  danger  out  noR  buf  idx  cnt  filt  abs  skip */
+    updateReport(i, -1.0f, -1.0f, false, false);
   }
 
-  /* WDT 초기화 — 실제 등록은 각 태스크 내부에서 수행 */
-  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  configureTaskWdt();
 
   Serial.println();
   Serial.println("=================================");
-  Serial.printf( "UWB ANCHOR #%d  (Phase B)\n", ANCHOR_ID);
+  Serial.printf( "UWB ANCHOR #%d  (FIXED)\n", ANCHOR_ID);
   Serial.printf( "Tags     : %d\n", NUM_TAGS);
+  for (int i = 0; i < NUM_TAGS; i++) Serial.printf("  - Tag#%d\n", TAG_IDS[i]);
   Serial.printf( "Safety   : %.1fm / %.1fm (enter/exit)\n", ENTER_DISTANCE_M, EXIT_DISTANCE_M);
   Serial.printf( "Filter   : median asym (enter=%d, exit=%d)\n", ENTER_FILTER_SIZE, DIST_FILTER_SIZE);
-  Serial.printf( "Cycle    : %dms/tag  max %dms\n", RNG_DELAY_MS, NUM_TAGS * RNG_DELAY_MS);
-  Serial.printf( "SlowPoll : absent x%d -> 1/%d rate\n", SLOW_POLL_THRESHOLD, SLOW_POLL_PERIOD);
+  Serial.printf( "Frame    : poll=%d resp=%d typeIdx=%d\n", POLL_MSG_LEN, RESP_MSG_LEN, MSG_TYPE_IDX);
   Serial.printf( "MQTT     : %s:%d\n", MQTT_BROKER, MQTT_PORT);
   Serial.println("=================================");
 
-  /* Core 1 — UWB 안전 루프 (최우선, 네트워크 독립) */
   xTaskCreatePinnedToCore(
     taskUWB, "UWB_Safety",
     8192, NULL,
-    2,          /* 우선순위 높음 */
-    NULL, 1     /* Core 1 고정 */
+    2,
+    NULL, 1
   );
 
-  /* Core 0 — 네트워크 리포팅 (낮은 우선순위, 실패 무방)
-   *
-   * SAFETY: taskNetwork는 의도적으로 panic WDT에 등록하지 않는다.
-   *   panic=true WDT에 묶으면 네트워크 hang(DNS/소켓 지연)이 칩 전체를
-   *   리부트시켜 Core 1 안전 루프까지 중단시킨다 — 안전 독립성 위배.
-   *   네트워크 hang은 socketTimeout(5s)+재연결 로직으로 자체 복구한다. */
   xTaskCreatePinnedToCore(
     taskNetwork, "Network",
-    8192,        /* WiFi/TLS 스택 고려해 여유있게 */
+    8192,
     NULL,
-    1,           /* 우선순위 낮음 */
-    NULL, 0      /* Core 0 고정 */
+    1,
+    NULL, 0
   );
 }
 
 void loop()
 {
-  vTaskDelete(NULL); /* loop()는 사용하지 않음 */
+  vTaskDelete(NULL);
 }
